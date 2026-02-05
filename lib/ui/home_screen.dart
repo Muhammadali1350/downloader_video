@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:gal/gal.dart';
 import 'package:percent_indicator/linear_percent_indicator.dart';
@@ -232,6 +233,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
             ],
           ),
+        ),
+        const SizedBox(width: 8),
+        // Copy All Button
+        IconButton(
+          onPressed: () {
+            final logs = ref.read(logsProvider);
+            if (logs.isNotEmpty) {
+              final text = logs.map((l) => '> $l').join('\n');
+              Clipboard.setData(ClipboardData(text: text));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                    content: Text('Logs copied to clipboard'),
+                    duration: Duration(seconds: 1)),
+              );
+            }
+          },
+          icon: Icon(Icons.copy_rounded,
+              size: 18, color: colorScheme.primary.withOpacity(0.7)),
+          tooltip: 'Copy all logs',
+          visualDensity: VisualDensity.compact,
         ),
         const Spacer(),
         Container(
@@ -468,29 +489,31 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           border: Border.all(color: const Color(0xFF262638)),
         ),
         padding: const EdgeInsets.all(8),
-        child: DefaultTextStyle(
-          style: const TextStyle(
-            fontFamily: 'monospace',
-            fontSize: 11,
-            color: Colors.greenAccent,
-          ),
-          child: logs.isEmpty
-              ? Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    '>> Waiting for commands...',
-                    style: TextStyle(
-                      color: Colors.greenAccent.withOpacity(0.6),
+        child: SelectionArea(
+          child: DefaultTextStyle(
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 11,
+              color: Colors.greenAccent,
+            ),
+            child: logs.isEmpty
+                ? Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      '>> Waiting for commands...',
+                      style: TextStyle(
+                        color: Colors.greenAccent.withOpacity(0.6),
+                      ),
                     ),
+                  )
+                : ListView.builder(
+                    itemCount: logs.length,
+                    itemBuilder: (context, index) {
+                      final line = logs[index];
+                      return Text('> $line');
+                    },
                   ),
-                )
-              : ListView.builder(
-                  itemCount: logs.length,
-                  itemBuilder: (context, index) {
-                    final line = logs[index];
-                    return Text('> $line');
-                  },
-                ),
+          ),
         ),
       ),
     );

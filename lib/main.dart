@@ -3,7 +3,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'ui/home_screen.dart';
 
-void main() {
+import 'package:media_store_plus/media_store_plus.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await MediaStore.ensureInitialized();
+  MediaStore.appFolder = 'DownloadVideos_App';
+
   runApp(
     const ProviderScope(
       child: DownloadVideosApp(),

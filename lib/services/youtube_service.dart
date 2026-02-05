@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:gal/gal.dart';
+import 'package:media_store_plus/media_store_plus.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
@@ -211,16 +213,39 @@ class YoutubeService {
 
     final sink = file.openWrite();
     var received = 0;
+    var lastLoggedMb = 0;
 
     try {
-      await for (final data in stream) {
+      // Wrap stream with timeout to detect hangs (0% progress issue)
+      final timedStream = stream.timeout(
+        const Duration(seconds: 10),
+        onTimeout: (sink) {
+          sink.addError(TimeoutException('Stream timed out after 10 seconds of no data.'));
+          sink.close();
+        },
+      );
+
+      await for (final data in timedStream) {
         received += data.length;
         sink.add(data);
 
         if (onProgress != null && totalBytes > 0) {
           onProgress(received / totalBytes);
         }
+
+        // Log every ~5 MB to verify activity without flooding logs
+        final currentMb = received ~/ (1024 * 1024 * 5);
+        if (currentMb > lastLoggedMb) {
+           onLog('Downloaded ${_formatBytes(received)} / ${_formatBytes(totalBytes)}');
+           lastLoggedMb = currentMb;
+        }
       }
+    } catch (e, st) {
+      onLog('Stream error: $e');
+      if (e is! TimeoutException) {
+         onLog(st.toString());
+      }
+      rethrow;
     } finally {
       await sink.close();
     }
@@ -229,7 +254,7 @@ class YoutubeService {
       onProgress(1.0);
     }
 
-    onLog('Download finished: ${file.path}');
+    onLog('Download finished: ${file.path} (Size: ${_formatBytes(received)})');
   }
 
   String _formatBytes(int bytes) {
@@ -257,34 +282,31 @@ class YoutubeService {
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
   }) async {
-    // Prefer M4A (AAC) if available, otherwise fall back to any audio-only.
-    final preferred = _withHighestBitrate(
-      manifest.audioOnly
-          .where((a) => a.container == StreamContainer.mp4),
-    );
-    final audio = preferred ?? manifest.audioOnly.withHighestBitrate();
+    // Use Muxed stream for audio download to avoid adaptive stream hangs.
+    // We select the lowest quality video to save bandwidth, since we only want audio.
+    final muxed = manifest.muxed.sortByBitrate().firstOrNull; // Lowest bitrate
 
-    if (audio == null) {
-      throw StateError('No suitable audio-only stream found.');
+    if (muxed == null) {
+      throw StateError('No muxed stream found for audio download.');
     }
 
     onLog(
-      'Selected audio stream: ${audio.codec} @ ${audio.bitrate.kiloBitsPerSecond.round()} kbps (${audio.container})',
+      'Selected muxed stream for audio source: ${muxed.videoResolution} @ ${muxed.bitrate.kiloBitsPerSecond.round()} kbps (${muxed.container})',
     );
 
     final audioTempPath =
-        p.join(baseDir.path, '$baseName.audio.${audio.container.name}');
+        p.join(baseDir.path, '$baseName.audio_source.${muxed.container.name}');
     final audioTempFile = File(audioTempPath);
 
     if (audioTempFile.existsSync()) {
       await audioTempFile.delete();
     }
 
-    final audioStream = yt.videos.streamsClient.get(audio);
+    final audioStream = yt.videos.streamsClient.get(muxed);
     await _downloadStreamToFile(
       stream: audioStream,
       file: audioTempFile,
-      totalBytes: audio.size.totalBytes,
+      totalBytes: muxed.size.totalBytes,
       onLog: onLog,
       onProgress: onProgress,
     );
@@ -303,28 +325,69 @@ class YoutubeService {
     final ffmpegCommand =
         '-y -i "${audioTempFile.path}" -vn -codec:a libmp3lame -qscale:a 2 "$mp3Path"';
 
+    onLog('Executing FFmpeg: $ffmpegCommand');
     final session = await FFmpegKit.execute(ffmpegCommand);
     final returnCode = await session.getReturnCode();
 
     if (!ReturnCode.isSuccess(returnCode)) {
       final output = await session.getOutput();
-      onLog('FFmpeg failed with code $returnCode. Output:\n$output');
+      final failLog = await session.getFailStackTrace();
+      onLog('FFmpeg failed with code $returnCode.\nOutput: $output\nFailLog: $failLog');
       throw StateError('FFmpeg audio conversion failed.');
     }
 
     onLog('MP3 created: $mp3Path');
 
-    // Export to gallery (Music) using Gal.
+    // Save to Music folder using MediaStore (Android 13+ compliant)
     onStatus?.call('exporting');
-    onLog('Saving MP3 to gallery via Gal.putVideo...');
-    await Gal.putVideo(mp3Path);
-    onLog('MP3 exported to gallery.');
+    onLog('Saving MP3 to Music folder via MediaStore...');
+
+    try {
+      if (Platform.isAndroid) {
+        final mediaStore = MediaStore();
+        await mediaStore.saveFile(
+          tempFilePath: mp3Path,
+          dirType: DirType.audio,
+          dirName: DirName.music,
+          relativePath: 'DownloadVideos_App', // Optional subfolder
+        );
+        onLog('MP3 saved to Music/DownloadVideos_App via MediaStore.');
+      } else {
+        // Fallback for non-Android (if any) or older behavior
+        await Gal.putVideo(mp3Path);
+        onLog('MP3 exported via Gal (non-Android/Older).');
+      }
+    } catch (e) {
+      onLog('MediaStore saving failed: $e');
+      onLog('Attempting direct save to Downloads folder (Android workaround)...');
+
+      try {
+         final downloadsPath = '/storage/emulated/0/Download';
+         final newPath = p.join(downloadsPath, '$baseName.mp3');
+         onLog('Copying to: $newPath');
+
+         if (Platform.isAndroid) {
+           final newFile = await mp3File.copy(newPath);
+           onLog('Success! Saved to: ${newFile.path}');
+         } else {
+           rethrow;
+         }
+      } catch (e2) {
+         onLog('Direct save failed: $e2');
+         onLog('File remains at: $mp3Path');
+         rethrow;
+      }
+    }
 
     // Best-effort cleanup of intermediate file.
     try {
       if (audioTempFile.existsSync()) {
         await audioTempFile.delete();
       }
+      // Note: MediaStorePlus usually copies the file.
+      // We might want to keep the temp file or delete it?
+      // Usually temp file should be deleted if successful.
+      // But let's leave mp3File for now in cache just in case.
     } catch (_) {
       // Ignore cleanup errors.
     }
@@ -390,21 +453,49 @@ class YoutubeService {
     final videoStream = yt.videos.streamsClient.get(video);
     final audioStream = yt.videos.streamsClient.get(audio);
 
-    await _downloadStreamToFile(
-      stream: videoStream,
-      file: videoFile,
-      totalBytes: video.size.totalBytes,
-      onLog: onLog,
-      onProgress: onProgress,
-    );
+    onLog('Starting download (Adaptive). If this hangs for 10s, app will auto-switch to Fast mode.');
 
-    await _downloadStreamToFile(
-      stream: audioStream,
-      file: audioFile,
-      totalBytes: audio.size.totalBytes,
-      onLog: onLog,
-      onProgress: onProgress,
-    );
+    try {
+      await _downloadStreamToFile(
+        stream: videoStream,
+        file: videoFile,
+        totalBytes: video.size.totalBytes,
+        onLog: onLog,
+        onProgress: onProgress,
+      );
+
+      await _downloadStreamToFile(
+        stream: audioStream,
+        file: audioFile,
+        totalBytes: audio.size.totalBytes,
+        onLog: onLog,
+        // We might want to handle progress differently for 2nd file,
+        // but existing logic just updates progress again.
+        // For now, let's keep it simple.
+        onProgress: onProgress,
+      );
+    } catch (e) {
+      onLog('Adaptive stream download failed: $e');
+      onLog('Falling back to "Muxed" (Fast) strategy to ensure download completion...');
+
+      // Clean up partial files
+      try {
+        if (videoFile.existsSync()) await videoFile.delete();
+        if (audioFile.existsSync()) await audioFile.delete();
+      } catch (_) {}
+
+      // Fallback: Download Muxed stream directly
+      await _downloadMuxed(
+        yt: yt,
+        manifest: manifest,
+        baseDir: baseDir,
+        baseName: baseName,
+        onLog: onLog,
+        onProgress: onProgress,
+        onStatus: onStatus,
+      );
+      return; // Stop merge execution
+    }
 
     // Merge inside temp directory.
     final outputPath = p.join(baseDir.path, '$baseName.merged.mp4');
