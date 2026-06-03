@@ -1,10 +1,17 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'services/youtube_service.dart';
+import 'services/settings_service.dart';
+
+/// Provides a singleton [SettingsService] instance.
+final settingsServiceProvider = Provider<SettingsService>((ref) {
+  return SettingsService();
+});
 
 /// Provides a singleton [YoutubeService] instance.
 final youtubeServiceProvider = Provider<YoutubeService>((ref) {
-  return YoutubeService();
+  final settingsService = ref.watch(settingsServiceProvider);
+  return YoutubeService(settingsService);
 });
 
 /// Aggregated logs to show in the UI (e.g. a console panel).

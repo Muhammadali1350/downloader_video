@@ -1,13 +1,16 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:gal/gal.dart';
+import 'package:http/http.dart' as http;
 import 'package:media_store_plus/media_store_plus.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import 'settings_service.dart';
 
 /// Simple analysis result for a YouTube URL.
 class YoutubeAnalysis {
@@ -32,7 +35,8 @@ class YoutubeAnalysis {
 /// - Uses FFmpeg for audio conversion / merging INSIDE the temp directory.
 /// - Exports the final file to the user's gallery via [Gal.putVideo].
 class YoutubeService {
-  YoutubeService();
+  final SettingsService _settingsService;
+  YoutubeService(this._settingsService);
 
   /// Supported modes.
   static const String modeAudio = 'audio';
@@ -47,28 +51,46 @@ class YoutubeService {
     String url, {
     required void Function(String) onLog,
   }) async {
-    final yt = YoutubeExplode();
+    final settings = await _settingsService.loadSettings();
+    final client = ConfiguredHttpClient(
+      userAgent: settings.userAgent,
+      cookies: settings.cookies,
+    );
+    final yt = YoutubeExplode(httpClient: YoutubeHttpClient(client));
 
     try {
       onLog('Analyzing URL...');
       final videoId = VideoId(url.trim());
-      final video = await yt.videos.get(videoId);
+      
+      YoutubeAnalysis analysis;
+      try {
+        final video = await yt.videos.get(videoId);
+        onLog('Title: ${video.title}');
+        onLog('Channel: ${video.author}');
+        if (video.duration != null) {
+          onLog('Duration: ${video.duration}');
+        }
+        final thumbnailUrl =
+            video.thumbnails.highResUrl ?? video.thumbnails.standardResUrl;
 
-      onLog('Title: ${video.title}');
-      onLog('Channel: ${video.author}');
-      if (video.duration != null) {
-        onLog('Duration: ${video.duration}');
+        analysis = YoutubeAnalysis(
+          title: video.title,
+          author: video.author,
+          duration: video.duration,
+          thumbnailUrl: thumbnailUrl,
+        );
+      } catch (e) {
+        onLog('Standard analyze failed: $e. Using fallback iOS API...');
+        analysis = await _fetchMetadataViaIosApi(videoId.value);
+        onLog('Fallback success!');
+        onLog('Title: ${analysis.title}');
+        onLog('Channel: ${analysis.author}');
+        if (analysis.duration != null) {
+          onLog('Duration: ${analysis.duration}');
+        }
       }
 
-      final thumbnailUrl =
-          video.thumbnails.highResUrl ?? video.thumbnails.standardResUrl;
-
-      return YoutubeAnalysis(
-        title: video.title,
-        author: video.author,
-        duration: video.duration,
-        thumbnailUrl: thumbnailUrl,
-      );
+      return analysis;
     } finally {
       yt.close();
     }
@@ -89,7 +111,12 @@ class YoutubeService {
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
   }) async {
-    final yt = YoutubeExplode();
+    final settings = await _settingsService.loadSettings();
+    final client = ConfiguredHttpClient(
+      userAgent: settings.userAgent,
+      cookies: settings.cookies,
+    );
+    final yt = YoutubeExplode(httpClient: YoutubeHttpClient(client));
 
     void log(String message) {
       onLog(message);
@@ -109,13 +136,25 @@ class YoutubeService {
       setStatus('downloading');
 
       log('Fetching video details...');
-      final video = await yt.videos.get(videoId);
-      final manifest = await yt.videos.streamsClient.getManifest(videoId);
+      String title;
+      try {
+        final video = await yt.videos.get(videoId);
+        title = video.title;
+      } catch (e) {
+        log('Standard fetch details failed: $e. Using fallback iOS API...');
+        final fallbackDetails = await _fetchMetadataViaIosApi(videoId.value);
+        title = fallbackDetails.title;
+      }
+
+      final manifest = await yt.videos.streamsClient.getManifest(
+        videoId,
+        requireWatchPage: false,
+      );
 
       final tempDir = await getTemporaryDirectory();
-      final safeTitle = _sanitizeFileName(video.title);
+      final safeTitle = _sanitizeFileName(title);
 
-      log('Resolved video: "${video.title}"');
+      log('Resolved video: "$title"');
       log('Using temporary directory: ${tempDir.path}');
 
       switch (mode) {
@@ -584,6 +623,98 @@ class YoutubeService {
     onLog('Saving muxed video to gallery via Gal.putVideo...');
     await Gal.putVideo(muxedPath);
     onLog('Muxed video exported to gallery.');
+  }
+
+  Future<YoutubeAnalysis> _fetchMetadataViaIosApi(String videoId) async {
+    final url = Uri.parse(
+      'https://www.youtube.com/youtubei/v1/player?key=AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc',
+    );
+    final headers = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+    };
+    final body = jsonEncode({
+      'videoId': videoId,
+      'context': {
+        'client': {
+          'clientName': 'IOS',
+          'clientVersion': '20.10.4',
+          'deviceMake': 'Apple',
+          'deviceModel': 'iPhone16,2',
+          'userAgent': 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+          'hl': 'en',
+          'platform': 'MOBILE',
+          'osName': 'IOS',
+          'osVersion': '18.1.0.22B83',
+          'timeZone': 'UTC',
+          'gl': 'US',
+          'utcOffsetMinutes': 0
+        }
+      }
+    });
+
+    final response = await http.post(url, headers: headers, body: body);
+    if (response.statusCode != 200) {
+      throw HttpException('Failed to fetch metadata from iOS API. Status code: ${response.statusCode}');
+    }
+
+    final json = jsonDecode(response.body) as Map<String, dynamic>;
+    
+    final playabilityStatus = json['playabilityStatus'] as Map<String, dynamic>?;
+    if (playabilityStatus != null && playabilityStatus['status'] == 'ERROR') {
+      throw StateError(playabilityStatus['reason'] ?? 'Video is unavailable');
+    }
+
+    final videoDetails = json['videoDetails'] as Map<String, dynamic>?;
+    if (videoDetails == null) {
+      throw StateError('videoDetails not found in response');
+    }
+
+    final title = videoDetails['title'] ?? 'Unknown Video';
+    final author = videoDetails['author'] ?? 'Unknown Channel';
+    final lengthSeconds = int.tryParse(videoDetails['lengthSeconds'] ?? '');
+    final duration = lengthSeconds != null ? Duration(seconds: lengthSeconds) : null;
+    
+    final thumbnailJson = videoDetails['thumbnail'] as Map<String, dynamic>?;
+    final thumbnails = thumbnailJson?['thumbnails'] as List<dynamic>?;
+    final thumbnailUrl = thumbnails != null && thumbnails.isNotEmpty
+        ? thumbnails.last['url'] as String
+        : 'https://img.youtube.com/vi/$videoId/0.jpg';
+
+    return YoutubeAnalysis(
+      title: title,
+      author: author,
+      duration: duration,
+      thumbnailUrl: thumbnailUrl,
+    );
+  }
+}
+
+class ConfiguredHttpClient extends http.BaseClient {
+  final http.Client _inner = http.Client();
+  final String userAgent;
+  final String cookies;
+
+  ConfiguredHttpClient({
+    required this.userAgent,
+    required this.cookies,
+  });
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    if (userAgent.isNotEmpty) {
+      request.headers['User-Agent'] = userAgent;
+    }
+    if (cookies.isNotEmpty) {
+      request.headers['Cookie'] = cookies;
+    }
+    return _inner.send(request);
+  }
+
+  @override
+  void close() {
+    _inner.close();
+    super.close();
   }
 }
 

@@ -6,6 +6,7 @@ import 'package:percent_indicator/linear_percent_indicator.dart';
 
 import '../providers.dart';
 import '../services/youtube_service.dart';
+import '../services/settings_service.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
@@ -157,6 +158,141 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
   }
 
+  Future<void> _showSettingsDialog(BuildContext context) async {
+    final settingsService = ref.read(settingsServiceProvider);
+    final settings = await settingsService.loadSettings();
+
+    final cookiesController = TextEditingController(text: settings.cookies);
+    final userAgentController = TextEditingController(text: settings.userAgent);
+
+    if (!context.mounted) return;
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        final colorScheme = Theme.of(context).colorScheme;
+        return AlertDialog(
+          backgroundColor: const Color(0xFF0F111A),
+          surfaceTintColor: Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: BorderSide(color: colorScheme.primary.withOpacity(0.2)),
+          ),
+          title: Row(
+            children: [
+              Icon(Icons.settings_rounded, color: colorScheme.primary),
+              const SizedBox(width: 8),
+              const Text(
+                'Настройки обхода',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Куки (Cookies) для авторизации:',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: cookiesController,
+                  maxLines: 4,
+                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                  decoration: InputDecoration(
+                    hintText: 'Вставьте Cookie (например, VISITOR_INFO1_LIVE=...)',
+                    suffixIcon: IconButton(
+                      icon: const Icon(Icons.clear, size: 18),
+                      onPressed: () => cookiesController.clear(),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Помогает обойти rate limit (429), если YouTube считает ваш IP подозрительным.',
+                  style: TextStyle(color: Colors.grey.shade500, fontSize: 11),
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      'User-Agent браузера:',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                    ),
+                    TextButton(
+                      style: TextButton.styleFrom(
+                        padding: EdgeInsets.zero,
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      onPressed: () {
+                        userAgentController.text = AppSettings.defaultSettings().userAgent;
+                      },
+                      child: const Text('Сбросить', style: TextStyle(fontSize: 12)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: userAgentController,
+                  maxLines: 2,
+                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                  decoration: const InputDecoration(
+                    hintText: 'User-Agent строка...',
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Имитирует реальный браузер для защиты от автоматической блокировки.',
+                  style: TextStyle(color: Colors.grey.shade500, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text(
+                'Отмена',
+                style: TextStyle(color: Colors.grey.shade400),
+              ),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: colorScheme.primary,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              onPressed: () async {
+                final newSettings = AppSettings(
+                  userAgent: userAgentController.text.trim(),
+                  cookies: cookiesController.text.trim(),
+                );
+                await settingsService.saveSettings(newSettings);
+                if (context.mounted) {
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Настройки сохранены! Попробуйте нажать Analyze снова.'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
+                }
+              },
+              child: const Text('Сохранить'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final logs = ref.watch(logsProvider);
@@ -169,6 +305,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       appBar: AppBar(
         title: const Text('YouTube Downloader'),
         centerTitle: false,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: 'Настройки обхода блокировок',
+            onPressed: () => _showSettingsDialog(context),
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
       body: SafeArea(
         child: Container(
