@@ -116,7 +116,8 @@ class YoutubeService {
       userAgent: settings.userAgent,
       cookies: settings.cookies,
     );
-    final yt = YoutubeExplode(httpClient: YoutubeHttpClient(client));
+    final customClient = CustomYoutubeHttpClient(client);
+    final yt = YoutubeExplode(httpClient: customClient);
 
     void log(String message) {
       onLog(message);
@@ -146,10 +147,22 @@ class YoutubeService {
         title = fallbackDetails.title;
       }
 
-      final manifest = await yt.videos.streamsClient.getManifest(
-        videoId,
-        requireWatchPage: false,
-      );
+      StreamManifest manifest;
+      try {
+        log('Fetching stream manifest (with watch page)...');
+        manifest = await yt.videos.streamsClient.getManifest(
+          videoId,
+          requireWatchPage: true,
+          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+        );
+      } catch (e) {
+        log('Failed to fetch manifest with watch page: $e. Using fallback player-only manifest...');
+        manifest = await yt.videos.streamsClient.getManifest(
+          videoId,
+          requireWatchPage: false,
+          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+        );
+      }
 
       final tempDir = await getTemporaryDirectory();
       final safeTitle = _sanitizeFileName(title);
@@ -445,23 +458,15 @@ class YoutubeService {
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
   }) async {
-    // Prefer mp4 video; fall back to any video-only.
-    final preferredVideo = _withHighestBitrate(
-      manifest.videoOnly
-          .where((v) => v.container == StreamContainer.mp4),
-    );
-    final video = preferredVideo ?? manifest.videoOnly.withHighestBitrate();
-
+    // Select the absolute highest quality video stream (MP4 or WebM/VP9)
+    final video = manifest.videoOnly.withHighestBitrate();
+ 
     if (video == null) {
       throw StateError('No suitable video-only stream found.');
     }
-
-    // Prefer m4a audio; fall back to any audio-only.
-    final preferredAudio = _withHighestBitrate(
-      manifest.audioOnly
-          .where((a) => a.container == StreamContainer.mp4),
-    );
-    final audio = preferredAudio ?? manifest.audioOnly.withHighestBitrate();
+ 
+    // Select the absolute highest quality audio stream
+    final audio = manifest.audioOnly.withHighestBitrate();
 
     if (audio == null) {
       throw StateError('No suitable audio-only stream found.');
@@ -495,12 +500,21 @@ class YoutubeService {
     onLog('Starting download (Adaptive). If this hangs for 10s, app will auto-switch to Fast mode.');
 
     try {
+      var videoBytesDownloaded = 0;
+      var audioBytesDownloaded = 0;
+      final totalExpectedBytes = video.size.totalBytes + audio.size.totalBytes;
+
       await _downloadStreamToFile(
         stream: videoStream,
         file: videoFile,
         totalBytes: video.size.totalBytes,
         onLog: onLog,
-        onProgress: onProgress,
+        onProgress: (p) {
+          videoBytesDownloaded = (p * video.size.totalBytes).round();
+          if (onProgress != null && totalExpectedBytes > 0) {
+            onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
+          }
+        },
       );
 
       await _downloadStreamToFile(
@@ -508,10 +522,12 @@ class YoutubeService {
         file: audioFile,
         totalBytes: audio.size.totalBytes,
         onLog: onLog,
-        // We might want to handle progress differently for 2nd file,
-        // but existing logic just updates progress again.
-        // For now, let's keep it simple.
-        onProgress: onProgress,
+        onProgress: (p) {
+          audioBytesDownloaded = (p * audio.size.totalBytes).round();
+          if (onProgress != null && totalExpectedBytes > 0) {
+            onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
+          }
+        },
       );
     } catch (e) {
       onLog('Adaptive stream download failed: $e');
@@ -715,6 +731,177 @@ class ConfiguredHttpClient extends http.BaseClient {
   void close() {
     _inner.close();
     super.close();
+  }
+}
+
+class CustomYoutubeHttpClient extends YoutubeHttpClient {
+  CustomYoutubeHttpClient([http.Client? httpClient]) : super(httpClient);
+
+  void customValidateResponse(http.BaseResponse response, int statusCode) {
+    if (closed) return;
+
+    final request = response.request!;
+
+    if (request.url.host.endsWith('.google.com') &&
+        request.url.path.startsWith('/sorry/')) {
+      throw RequestLimitExceededException.httpRequest(response);
+    }
+
+    if (statusCode >= 500) {
+      throw TransientFailureException.httpRequest(response);
+    }
+
+    if (statusCode == 429) {
+      throw RequestLimitExceededException.httpRequest(response);
+    }
+
+    if (statusCode >= 400) {
+      throw FatalFailureException.httpRequest(response);
+    }
+  }
+
+  Uri _setQueryParam(Uri uri, String key, String value) {
+    final params = Map<String, String>.from(uri.queryParameters);
+    params[key] = value;
+    return uri.replace(queryParameters: params);
+  }
+
+  Future<T> _retry<T>(Future<T> Function() fn, {int retries = 5}) async {
+    int attempts = 0;
+    while (true) {
+      try {
+        return await fn();
+      } catch (e) {
+        attempts++;
+        if (attempts >= retries) {
+          rethrow;
+        }
+        await Future.delayed(Duration(milliseconds: 500 * attempts));
+      }
+    }
+  }
+
+  @override
+  Stream<List<int>> getStream(
+    StreamInfo streamInfo, {
+    Map<String, String> headers = const {},
+    bool validate = true,
+    int start = 0,
+    int errorCount = 0,
+    required StreamClient streamClient,
+  }) {
+    if (streamInfo.fragments.isNotEmpty) {
+      return super.getStream(streamInfo,
+          headers: headers,
+          validate: validate,
+          start: start,
+          errorCount: errorCount,
+          streamClient: streamClient);
+    }
+    if (streamInfo.runtimeType.toString().contains('Hls')) {
+      return super.getStream(streamInfo,
+          headers: headers,
+          validate: validate,
+          start: start,
+          errorCount: errorCount,
+          streamClient: streamClient);
+    }
+    return _getCustomStream(
+      streamInfo,
+      headers: headers,
+      validate: validate,
+      start: start,
+      errorCount: errorCount,
+      streamClient: streamClient,
+    );
+  }
+
+  Stream<List<int>> _getCustomStream(
+    StreamInfo streamInfo, {
+    Map<String, String> headers = const {},
+    bool validate = true,
+    int start = 0,
+    int errorCount = 0,
+    required StreamClient streamClient,
+  }) async* {
+    var url = streamInfo.url;
+    int bytesCount = start;
+    const int chunkSize = 512 * 1024; // 512 KB chunks
+
+    while (!closed && bytesCount < streamInfo.size.totalBytes) {
+      try {
+        final response = await _retry(() async {
+          final from = bytesCount;
+          var to = from + chunkSize - 1;
+          if (to >= streamInfo.size.totalBytes) {
+            to = streamInfo.size.totalBytes - 1;
+          }
+
+          late final http.Request request;
+          final useRangeHeader = url.queryParameters['c']?.startsWith('ANDROID') ?? false;
+          if (useRangeHeader) {
+            request = http.Request('get', url);
+            request.headers['Range'] = 'bytes=$from-$to';
+          } else {
+            request =
+                http.Request('get', _setQueryParam(url, 'range', '$from-$to'));
+          }
+          return send(request);
+        });
+
+        if (validate) {
+          try {
+            customValidateResponse(response, response.statusCode);
+          } on FatalFailureException {
+            final newManifest =
+                await streamClient.getManifest(streamInfo.videoId);
+            StreamInfo? stream;
+            for (final s in newManifest.streams) {
+              if (s.tag == streamInfo.tag) {
+                stream = s;
+                break;
+              }
+            }
+            if (stream == null) {
+              rethrow;
+            }
+            url = stream.url;
+            continue;
+          }
+        }
+
+        final controller = StreamController<List<int>>();
+        response.stream.listen(
+          (List<int> data) {
+            bytesCount += data.length;
+            controller.add(data);
+          },
+          onError: (e) {
+            // Ignore/handle
+          },
+          onDone: controller.close,
+          cancelOnError: false,
+        );
+        errorCount = 0;
+        yield* controller.stream;
+      } on HttpClientClosedException {
+        break;
+      } on Exception {
+        if (errorCount == 5) {
+          rethrow;
+        }
+        await Future.delayed(const Duration(milliseconds: 500));
+        yield* _getCustomStream(
+          streamInfo,
+          headers: headers,
+          validate: validate,
+          start: bytesCount,
+          errorCount: errorCount + 1,
+          streamClient: streamClient,
+        );
+        break;
+      }
+    }
   }
 }
 
