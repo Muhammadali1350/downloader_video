@@ -12,6 +12,21 @@ import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'settings_service.dart';
 
+class CancellationException implements Exception {
+  final String message;
+  CancellationException([this.message = 'Загрузка отменена пользователем.']);
+  @override
+  String toString() => message;
+}
+
+typedef DetailedProgressCallback = void Function({
+  double? videoProgress,
+  double? audioProgress,
+  String? currentAction,
+});
+
+typedef PlaylistProgressCallback = void Function(String videoId, double progress);
+
 /// Simple analysis result for a YouTube URL.
 class YoutubeAnalysis {
   YoutubeAnalysis({
@@ -84,25 +99,46 @@ class YoutubeStreamFormat {
 }
 
 /// Core YouTube download / processing logic.
-///
-/// This service:
-/// - Parses any YouTube URL (including Shorts) via [VideoId].
-/// - ALWAYS downloads into the platform temporary directory.
-/// - Uses FFmpeg for audio conversion / merging INSIDE the temp directory.
-/// - Exports the final file to the user's gallery via [Gal.putVideo].
 class YoutubeService {
   final SettingsService _settingsService;
   YoutubeService(this._settingsService);
+
+  bool _isCancelled = false;
+
+  void cancelDownload() {
+    _isCancelled = true;
+  }
+
+  void resetCancel() {
+    _isCancelled = false;
+  }
+
+  bool get isCancelled => _isCancelled;
 
   /// Supported modes.
   static const String modeAudio = 'audio';
   static const String modeMerge = 'merge';
   static const String modeMuxed = 'muxed';
 
+  /// Extract VideoId robustly, with custom parsing for YouTube Shorts.
+  VideoId _resolveVideoId(String url) {
+    final trimmed = url.trim();
+    try {
+      final uri = Uri.parse(trimmed);
+      if (uri.pathSegments.contains('shorts')) {
+        final idx = uri.pathSegments.indexOf('shorts');
+        if (idx >= 0 && idx < uri.pathSegments.length - 1) {
+          final possibleId = uri.pathSegments[idx + 1];
+          if (possibleId.length == 11) {
+            return VideoId(possibleId);
+          }
+        }
+      }
+    } catch (_) {}
+    return VideoId(trimmed);
+  }
+
   /// Analyze a YouTube [url] and return basic metadata.
-  ///
-  /// This is lightweight and intended to power the UI "Analyze" step
-  /// (enabling buttons, showing title, etc.).
   Future<YoutubeAnalysis> analyzeUrl(
     String url, {
     required void Function(String) onLog,
@@ -112,7 +148,7 @@ class YoutubeService {
       userAgent: settings.userAgent,
       cookies: settings.cookies,
     );
-    final customClient = CustomYoutubeHttpClient(client);
+    final customClient = CustomYoutubeHttpClient(client, this);
     final yt = YoutubeExplode(httpClient: customClient);
 
     try {
@@ -142,7 +178,7 @@ class YoutubeService {
               title: video.title,
               author: video.author,
               duration: video.duration,
-              thumbnailUrl: video.thumbnails.highResUrl ?? video.thumbnails.standardResUrl,
+              thumbnailUrl: video.thumbnails.highResUrl,
             ));
           }
           
@@ -186,7 +222,7 @@ class YoutubeService {
         title = video.title;
         author = video.author;
         duration = video.duration;
-        thumbnailUrl = video.thumbnails.highResUrl ?? video.thumbnails.standardResUrl;
+        thumbnailUrl = video.thumbnails.highResUrl;
       } catch (e) {
         onLog('Metadata fetch failed: $e. Using fallback iOS API...');
         final fallbackDetails = await _fetchMetadataViaIosApi(videoId.value);
@@ -268,41 +304,31 @@ class YoutubeService {
   }
 
   /// Download a YouTube video in the given [mode].
-  ///
-  /// - [url] can be any YouTube URL (short, share link, etc.).
-  /// - [mode] must be one of: `audio`, `merge`, `muxed`.
-  /// - [onLog] is used for real-time logging to the UI.
-  /// - [onProgress] is optional and reports 0.0–1.0 during network downloads.
-  /// - [onStatus] is optional and can be used to drive a status provider
-  ///   (`idle`, `downloading`, `converting`, `exporting`, `done`, `error`).
   Future<void> downloadVideo(
     String url, {
     required String mode,
     required void Function(String) onLog,
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
+    void Function(double speed, String eta)? onStats,
+    DetailedProgressCallback? onDetailedProgress,
+    String? playlistName,
   }) async {
     final settings = await _settingsService.loadSettings();
     final client = ConfiguredHttpClient(
       userAgent: settings.userAgent,
       cookies: settings.cookies,
     );
-    final customClient = CustomYoutubeHttpClient(client);
+    final customClient = CustomYoutubeHttpClient(client, this);
     final yt = YoutubeExplode(httpClient: customClient);
 
-    void log(String message) {
-      onLog(message);
-    }
+    void log(String message) => onLog(message);
+    void setStatus(String status) => onStatus?.call(status);
 
-    void setStatus(String status) {
-      if (onStatus != null) {
-        onStatus(status);
-      }
-    }
-
+    String? safeTitle;
     try {
+      resetCancel();
       log('Parsing URL...');
-      // CRITICAL: use _resolveVideoId to correctly parse Shorts / dirty URLs.
       final videoId = _resolveVideoId(url);
 
       setStatus('downloading');
@@ -317,6 +343,9 @@ class YoutubeService {
         final fallbackDetails = await _fetchMetadataViaIosApi(videoId.value);
         title = fallbackDetails.title;
       }
+
+      final tempDir = await getTemporaryDirectory();
+      safeTitle = _sanitizeFileName(title);
 
       StreamManifest manifest;
       try {
@@ -335,11 +364,10 @@ class YoutubeService {
         );
       }
 
-      final tempDir = await getTemporaryDirectory();
-      final safeTitle = _sanitizeFileName(title);
-
       log('Resolved video: "$title"');
       log('Using temporary directory: ${tempDir.path}');
+
+      if (_isCancelled) throw CancellationException();
 
       switch (mode) {
         case modeAudio:
@@ -351,6 +379,9 @@ class YoutubeService {
             onLog: log,
             onProgress: onProgress,
             onStatus: setStatus,
+            onStats: onStats,
+            onDetailedProgress: onDetailedProgress,
+            playlistName: playlistName,
           );
           break;
         case modeMerge:
@@ -362,6 +393,9 @@ class YoutubeService {
             onLog: log,
             onProgress: onProgress,
             onStatus: setStatus,
+            onStats: onStats,
+            onDetailedProgress: onDetailedProgress,
+            playlistName: playlistName,
           );
           break;
         case modeMuxed:
@@ -373,22 +407,39 @@ class YoutubeService {
             onLog: log,
             onProgress: onProgress,
             onStatus: setStatus,
+            onStats: onStats,
+            onDetailedProgress: onDetailedProgress,
+            playlistName: playlistName,
           );
           break;
         default:
-          throw ArgumentError.value(
-            mode,
-            'mode',
-            'Unsupported mode. Expected one of: $modeAudio, $modeMerge, $modeMuxed.',
-          );
+          throw ArgumentError.value(mode, 'mode', 'Unsupported mode.');
       }
 
       setStatus('done');
       log('Done.');
     } catch (e, stackTrace) {
-      setStatus('error');
-      log('Error: $e');
-      log(stackTrace.toString());
+      if (safeTitle != null) {
+        try {
+          final tempDir = await getTemporaryDirectory();
+          final dir = Directory(tempDir.path);
+          if (dir.existsSync()) {
+            for (final file in dir.listSync()) {
+              if (file is File && p.basename(file.path).startsWith(safeTitle)) {
+                await file.delete();
+              }
+            }
+          }
+        } catch (_) {}
+      }
+      if (e is CancellationException) {
+        setStatus('cancelled');
+        log('Скачивание отменено пользователем.');
+      } else {
+        setStatus('error');
+        log('Error: $e');
+        log(stackTrace.toString());
+      }
       rethrow;
     } finally {
       yt.close();
@@ -402,13 +453,24 @@ class YoutubeService {
     required void Function(String) onLog,
     required void Function(double progress) onProgress,
     required void Function(String status) onStatus,
+    void Function(double speed, String eta)? onStats,
+    DetailedProgressCallback? onDetailedProgress,
+    PlaylistProgressCallback? onVideoProgress,
+    String? playlistTitle,
   }) async {
     void log(String message) => onLog(message);
     log('Начало загрузки плейлиста: ${videoIds.length} видео в режиме "$mode"...');
     
     int successfulDownloads = 0;
+    resetCancel();
+
+    final safePlaylistTitle = playlistTitle != null ? _sanitizeFileName(playlistTitle) : 'Playlist';
 
     for (int i = 0; i < videoIds.length; i++) {
+      if (_isCancelled) {
+        log('Загрузка плейлиста отменена пользователем.');
+        break;
+      }
       final videoId = videoIds[i];
       final videoUrl = 'https://www.youtube.com/watch?v=$videoId';
       log('-----------------------------------------');
@@ -418,24 +480,34 @@ class YoutubeService {
         await downloadVideo(
           videoUrl,
           mode: mode,
+          playlistName: safePlaylistTitle,
           onLog: (msg) => log('[Видео ${i + 1}] $msg'),
           onProgress: (p) {
             final overallProgress = (i + p) / videoIds.length;
             onProgress(overallProgress);
+            if (onVideoProgress != null) {
+              onVideoProgress(videoId, p);
+            }
           },
           onStatus: (status) {
-             onStatus('downloading'); // Keep status as downloading during the playlist loop
+             onStatus('downloading');
           },
+          onStats: onStats,
+          onDetailedProgress: onDetailedProgress,
         );
         successfulDownloads++;
         log('Успешно загружено видео ${i + 1} из ${videoIds.length}');
       } catch (e) {
+        if (e is CancellationException) {
+          log('Загрузка плейлиста отменена.');
+          rethrow;
+        }
         log('Ошибка при загрузке видео ${i + 1}: $e');
       }
     }
     
     onProgress(1.0);
-    onStatus('done');
+    onStatus(_isCancelled ? 'cancelled' : 'done');
     log('Загрузка плейлиста завершена. Успешно загружено: $successfulDownloads из ${videoIds.length} видео.');
   }
 
@@ -447,26 +519,24 @@ class YoutubeService {
     required void Function(String) onLog,
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
+    void Function(double speed, String eta)? onStats,
+    DetailedProgressCallback? onDetailedProgress,
+    String? playlistName,
   }) async {
     final settings = await _settingsService.loadSettings();
     final client = ConfiguredHttpClient(
       userAgent: settings.userAgent,
       cookies: settings.cookies,
     );
-    final customClient = CustomYoutubeHttpClient(client);
+    final customClient = CustomYoutubeHttpClient(client, this);
     final yt = YoutubeExplode(httpClient: customClient);
 
-    void log(String message) {
-      onLog(message);
-    }
+    void log(String message) => onLog(message);
+    void setStatus(String status) => onStatus?.call(status);
 
-    void setStatus(String status) {
-      if (onStatus != null) {
-        onStatus(status);
-      }
-    }
-
+    String? safeTitle;
     try {
+      resetCancel();
       log('Parsing URL...');
       final videoId = _resolveVideoId(url);
 
@@ -501,18 +571,19 @@ class YoutubeService {
       }
 
       final tempDir = await getTemporaryDirectory();
-      final safeTitle = _sanitizeFileName(title);
+      safeTitle = _sanitizeFileName(title);
 
       log('Resolved video: "$title"');
       log('Using temporary directory: ${tempDir.path}');
 
+      if (_isCancelled) throw CancellationException();
+
       if (videoTag != null && audioTag != null) {
-        // Mode: Merge custom video + custom audio
         final video = manifest.streams.firstWhere((e) => e.tag == videoTag) as VideoStreamInfo;
         final audio = manifest.streams.firstWhere((e) => e.tag == audioTag) as AudioStreamInfo;
 
-        log('Selected video: ${video.videoResolution} @ ${video.bitrate.kiloBitsPerSecond.round()} kbps (${video.container})');
-        log('Selected audio: ${audio.codec} @ ${audio.bitrate.kiloBitsPerSecond.round()} kbps (${audio.container})');
+        log('Selected video: ${video.videoResolution} (${video.container})');
+        log('Selected audio: ${audio.codec} (${audio.container})');
 
         final videoPath = p.join(tempDir.path, '$safeTitle.video.${video.container.name}');
         final audioPath = p.join(tempDir.path, '$safeTitle.audio.${audio.container.name}');
@@ -530,37 +601,54 @@ class YoutubeService {
         var audioBytesDownloaded = 0;
         final totalExpectedBytes = video.size.totalBytes + audio.size.totalBytes;
 
-        await _downloadStreamToFile(
-          stream: videoStream,
-          file: videoFile,
-          totalBytes: video.size.totalBytes,
-          onLog: log,
-          onProgress: (p) {
-            videoBytesDownloaded = (p * video.size.totalBytes).round();
-            if (onProgress != null && totalExpectedBytes > 0) {
-              onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
-            }
-          },
-        );
+        try {
+          await _downloadStreamToFile(
+            stream: videoStream,
+            file: videoFile,
+            totalBytes: video.size.totalBytes,
+            onLog: log,
+            onProgress: (p) {
+              videoBytesDownloaded = (p * video.size.totalBytes).round();
+              if (onProgress != null && totalExpectedBytes > 0) {
+                onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
+              }
+              onDetailedProgress?.call(videoProgress: p, currentAction: 'downloading_video');
+            },
+            onStats: onStats,
+          );
 
-        await _downloadStreamToFile(
-          stream: audioStream,
-          file: audioFile,
-          totalBytes: audio.size.totalBytes,
-          onLog: log,
-          onProgress: (p) {
-            audioBytesDownloaded = (p * audio.size.totalBytes).round();
-            if (onProgress != null && totalExpectedBytes > 0) {
-              onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
-            }
-          },
-        );
+          if (_isCancelled) throw CancellationException();
+
+          await _downloadStreamToFile(
+            stream: audioStream,
+            file: audioFile,
+            totalBytes: audio.size.totalBytes,
+            onLog: log,
+            onProgress: (p) {
+              audioBytesDownloaded = (p * audio.size.totalBytes).round();
+              if (onProgress != null && totalExpectedBytes > 0) {
+                onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
+              }
+              onDetailedProgress?.call(audioProgress: p, currentAction: 'downloading_audio');
+            },
+            onStats: onStats,
+          );
+        } catch (e) {
+          try {
+            if (videoFile.existsSync()) await videoFile.delete();
+            if (audioFile.existsSync()) await audioFile.delete();
+          } catch (_) {}
+          rethrow;
+        }
+
+        if (_isCancelled) throw CancellationException();
 
         final outputPath = p.join(tempDir.path, '$safeTitle.merged.mp4');
         final outputFile = File(outputPath);
         if (outputFile.existsSync()) await outputFile.delete();
 
         setStatus('converting');
+        onDetailedProgress?.call(currentAction: 'converting');
         log('Merging video and audio via FFmpeg...');
 
         final ffmpegCommand = '-y -i "${videoFile.path}" -i "${audioFile.path}" -c:v copy -c:a aac "$outputPath"';
@@ -575,16 +663,16 @@ class YoutubeService {
 
         log('Merged file created: $outputPath');
         setStatus('exporting');
-        log('Saving merged video to gallery via Gal.putVideo...');
-        await Gal.putVideo(outputPath);
-        log('Merged video exported to gallery.');
+        onDetailedProgress?.call(currentAction: 'exporting');
+        
+        await _saveVideoToGallery(outputPath, playlistName, log);
 
         try {
           if (videoFile.existsSync()) await videoFile.delete();
           if (audioFile.existsSync()) await audioFile.delete();
+          if (outputFile.existsSync()) await outputFile.delete();
         } catch (_) {}
       } else if (videoTag != null) {
-        // Mode: Only Video
         final video = manifest.streams.firstWhere((e) => e.tag == videoTag) as VideoStreamInfo;
         log('Selected video: ${video.videoResolution} (${video.container})');
 
@@ -594,20 +682,35 @@ class YoutubeService {
 
         final videoStream = yt.videos.streamsClient.get(video);
 
-        await _downloadStreamToFile(
-          stream: videoStream,
-          file: videoFile,
-          totalBytes: video.size.totalBytes,
-          onLog: log,
-          onProgress: onProgress,
-        );
+        try {
+          await _downloadStreamToFile(
+            stream: videoStream,
+            file: videoFile,
+            totalBytes: video.size.totalBytes,
+            onLog: log,
+            onProgress: (p) {
+              if (onProgress != null) onProgress(p);
+              onDetailedProgress?.call(videoProgress: p, currentAction: 'downloading_video');
+            },
+            onStats: onStats,
+          );
+        } catch (e) {
+          try {
+            if (videoFile.existsSync()) await videoFile.delete();
+          } catch (_) {}
+          rethrow;
+        }
+
+        if (_isCancelled) throw CancellationException();
 
         setStatus('exporting');
-        log('Saving video to gallery via Gal.putVideo...');
-        await Gal.putVideo(videoPath);
-        log('Video exported to gallery.');
+        onDetailedProgress?.call(currentAction: 'exporting');
+        await _saveVideoToGallery(videoPath, playlistName, log);
+        
+        try {
+          if (videoFile.existsSync()) await videoFile.delete();
+        } catch (_) {}
       } else if (audioTag != null) {
-        // Mode: Only Audio (MP3)
         final audio = manifest.streams.firstWhere((e) => e.tag == audioTag) as AudioStreamInfo;
         log('Selected audio: ${audio.codec} (${audio.container})');
 
@@ -617,15 +720,29 @@ class YoutubeService {
 
         final audioStream = yt.videos.streamsClient.get(audio);
 
-        await _downloadStreamToFile(
-          stream: audioStream,
-          file: audioFile,
-          totalBytes: audio.size.totalBytes,
-          onLog: log,
-          onProgress: onProgress,
-        );
+        try {
+          await _downloadStreamToFile(
+            stream: audioStream,
+            file: audioFile,
+            totalBytes: audio.size.totalBytes,
+            onLog: log,
+            onProgress: (p) {
+              if (onProgress != null) onProgress(p);
+              onDetailedProgress?.call(audioProgress: p, currentAction: 'downloading_audio');
+            },
+            onStats: onStats,
+          );
+        } catch (e) {
+          try {
+            if (audioFile.existsSync()) await audioFile.delete();
+          } catch (_) {}
+          rethrow;
+        }
+
+        if (_isCancelled) throw CancellationException();
 
         setStatus('converting');
+        onDetailedProgress?.call(currentAction: 'converting');
         final mp3Path = p.join(tempDir.path, '$safeTitle.mp3');
         final mp3File = File(mp3Path);
         if (mp3File.existsSync()) await mp3File.delete();
@@ -643,41 +760,9 @@ class YoutubeService {
 
         log('MP3 created: $mp3Path');
         setStatus('exporting');
-        log('Saving MP3 to Music folder via MediaStore...');
-
-        try {
-          if (Platform.isAndroid) {
-            final mediaStore = MediaStore();
-            await mediaStore.saveFile(
-              tempFilePath: mp3Path,
-              dirType: DirType.audio,
-              dirName: DirName.music,
-              relativePath: 'DownloadVideos_App',
-            );
-            log('MP3 saved to Music/DownloadVideos_App via MediaStore.');
-          } else {
-            await Gal.putVideo(mp3Path);
-            log('MP3 exported via Gal.');
-          }
-        } catch (e) {
-          log('MediaStore saving failed: $e');
-          log('Attempting direct save to Downloads folder...');
-          try {
-            final downloadsPath = '/storage/emulated/0/Download';
-            final newPath = p.join(downloadsPath, '$safeTitle.mp3');
-            log('Copying to: $newPath');
-            if (Platform.isAndroid) {
-              final newFile = await mp3File.copy(newPath);
-              log('Success! Saved to: ${newFile.path}');
-            } else {
-              rethrow;
-            }
-          } catch (e2) {
-            log('Direct save failed: $e2');
-            log('File remains at: $mp3Path');
-            rethrow;
-          }
-        }
+        onDetailedProgress?.call(currentAction: 'exporting');
+        
+        await _saveAudioToMusic(mp3Path, playlistName, log);
 
         try {
           if (audioFile.existsSync()) await audioFile.delete();
@@ -688,58 +773,117 @@ class YoutubeService {
       setStatus('done');
       log('Done.');
     } catch (e, stackTrace) {
-      setStatus('error');
-      log('Error: $e');
-      log(stackTrace.toString());
+      if (safeTitle != null) {
+        try {
+          final tempDir = await getTemporaryDirectory();
+          final dir = Directory(tempDir.path);
+          if (dir.existsSync()) {
+            for (final file in dir.listSync()) {
+              if (file is File && p.basename(file.path).startsWith(safeTitle)) {
+                await file.delete();
+              }
+            }
+          }
+        } catch (_) {}
+      }
+      if (e is CancellationException) {
+        setStatus('cancelled');
+        log('Загрузка отменена пользователем.');
+      } else {
+        setStatus('error');
+        log('Error: $e');
+        log(stackTrace.toString());
+      }
       rethrow;
     } finally {
       yt.close();
     }
   }
 
-  /// Extract VideoId robustly, with custom parsing for YouTube Shorts.
-  VideoId _resolveVideoId(String url) {
-    final trimmed = url.trim();
-    try {
-      final uri = Uri.parse(trimmed);
-      if (uri.pathSegments.contains('shorts')) {
-        final idx = uri.pathSegments.indexOf('shorts');
-        if (idx >= 0 && idx < uri.pathSegments.length - 1) {
-          final possibleId = uri.pathSegments[idx + 1];
-          if (possibleId.length == 11) {
-            return VideoId(possibleId);
-          }
-        }
-      }
-    } catch (_) {}
-    return VideoId(trimmed);
-  }
-
   /// Make a filesystem-safe file name from a video title.
   String _sanitizeFileName(String input) {
-    // Strip control characters.
     final withoutControl = input.replaceAll(RegExp(r'[\x00-\x1F]'), '');
-    // Replace characters that are invalid on typical filesystems.
     final sanitized =
         withoutControl.replaceAll(RegExp(r'[<>:"/\\|?*]+'), '_').trim();
-
     if (sanitized.isEmpty) {
       return 'video';
     }
-
-    const maxLength = 120;
+    const maxLength = 80; // Shorter to avoid filesystem path too long errors
     if (sanitized.length > maxLength) {
       return sanitized.substring(0, maxLength);
     }
     return sanitized;
   }
 
-  /// Selects the stream with the highest bitrate from [streams].
-  T? _withHighestBitrate<T extends StreamInfo>(Iterable<T> streams) {
-    if (streams.isEmpty) return null;
-    return streams.reduce(
-      (a, b) => a.bitrate.bitsPerSecond >= b.bitrate.bitsPerSecond ? a : b,
-    );
+  /// Helper to save video to shared movies folder or fallback to Gal
+  Future<void> _saveVideoToGallery(
+    String tempFilePath,
+    String? playlistName,
+    void Function(String) onLog,
+  ) async {
+    if (Platform.isAndroid) {
+      try {
+        final pathPrefix = playlistName ?? 'DownloadVideos_App';
+        onLog('Saving video to movies/$pathPrefix via MediaStore...');
+        final mediaStore = MediaStore();
+        await mediaStore.saveFile(
+          tempFilePath: tempFilePath,
+          dirType: DirType.video,
+          dirName: DirName.movies,
+          relativePath: pathPrefix,
+        );
+        onLog('Video successfully saved via MediaStore.');
+      } catch (e) {
+        onLog('MediaStore failed: $e. Falling back to Gal...');
+        await Gal.putVideo(tempFilePath);
+        onLog('Video exported via Gal.');
+      }
+    } else {
+      await Gal.putVideo(tempFilePath);
+      onLog('Video exported via Gal.');
+    }
+  }
+
+  /// Helper to save audio to shared music folder
+  Future<void> _saveAudioToMusic(
+    String tempFilePath,
+    String? playlistName,
+    void Function(String) onLog,
+  ) async {
+    if (Platform.isAndroid) {
+      try {
+        final pathPrefix = playlistName != null ? 'DownloadVideos_App/$playlistName' : 'DownloadVideos_App';
+        onLog('Saving MP3 to music/$pathPrefix via MediaStore...');
+        final mediaStore = MediaStore();
+        await mediaStore.saveFile(
+          tempFilePath: tempFilePath,
+          dirType: DirType.audio,
+          dirName: DirName.music,
+          relativePath: pathPrefix,
+        );
+        onLog('MP3 saved successfully via MediaStore.');
+      } catch (e) {
+        onLog('MediaStore saving failed: $e. Falling back to direct Downloads copy...');
+        await _fallbackSaveAudio(tempFilePath, onLog);
+      }
+    } else {
+      await Gal.putVideo(tempFilePath);
+      onLog('MP3 exported via Gal (non-Android).');
+    }
+  }
+
+  Future<void> _fallbackSaveAudio(String mp3Path, void Function(String) onLog) async {
+    try {
+      final file = File(mp3Path);
+      final downloadsPath = '/storage/emulated/0/Download';
+      final newPath = p.join(downloadsPath, p.basename(mp3Path));
+      onLog('Copying to: $newPath');
+      await file.copy(newPath);
+      onLog('Success! Saved to Downloads: $newPath');
+    } catch (e2) {
+      onLog('Direct save failed: $e2');
+      rethrow;
+    }
   }
 
   /// Download a YouTube stream into [file], reporting progress.
@@ -749,17 +893,17 @@ class YoutubeService {
     required int totalBytes,
     required void Function(String) onLog,
     void Function(double progress)? onProgress,
+    void Function(double speed, String eta)? onStats,
   }) async {
-    onLog(
-      'Downloading to ${file.path} (${_formatBytes(totalBytes)})...',
-    );
+    onLog('Downloading to ${file.path} (${_formatBytes(totalBytes)})...');
 
     final sink = file.openWrite();
     var received = 0;
     var lastLoggedMb = 0;
+    final stopwatch = Stopwatch()..start();
+    var lastStatsUpdate = DateTime.now();
 
     try {
-      // Wrap stream with timeout to detect hangs (0% progress issue)
       final timedStream = stream.timeout(
         const Duration(seconds: 10),
         onTimeout: (sink) {
@@ -769,6 +913,9 @@ class YoutubeService {
       );
 
       await for (final data in timedStream) {
+        if (_isCancelled) {
+          throw CancellationException();
+        }
         received += data.length;
         sink.add(data);
 
@@ -776,7 +923,18 @@ class YoutubeService {
           onProgress(received / totalBytes);
         }
 
-        // Log every ~5 MB to verify activity without flooding logs
+        final now = DateTime.now();
+        if (onStats != null && now.difference(lastStatsUpdate).inMilliseconds > 400) {
+          final elapsedSecs = stopwatch.elapsedMilliseconds / 1000.0;
+          if (elapsedSecs > 0) {
+            final speed = received / elapsedSecs; // B/s
+            final remainingBytes = totalBytes - received;
+            final etaSecs = speed > 0 ? (remainingBytes / speed).round() : 0;
+            onStats(speed, _formatEta(etaSecs));
+          }
+          lastStatsUpdate = now;
+        }
+
         final currentMb = received ~/ (1024 * 1024 * 5);
         if (currentMb > lastLoggedMb) {
            onLog('Downloaded ${_formatBytes(received)} / ${_formatBytes(totalBytes)}');
@@ -796,7 +954,6 @@ class YoutubeService {
     if (onProgress != null) {
       onProgress(1.0);
     }
-
     onLog('Download finished: ${file.path} (Size: ${_formatBytes(received)})');
   }
 
@@ -812,10 +969,18 @@ class YoutubeService {
     return '$bytes B';
   }
 
+  String _formatEta(int seconds) {
+    if (seconds <= 0) return '00:00';
+    final hours = seconds ~/ 3600;
+    final minutes = (seconds % 3600) ~/ 60;
+    final secs = seconds % 60;
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, "0")}:${minutes.toString().padLeft(2, "0")}:${secs.toString().padLeft(2, "0")}';
+    }
+    return '${minutes.toString().padLeft(2, "0")}:${secs.toString().padLeft(2, "0")}';
+  }
+
   /// Mode `audio`:
-  /// - Download best audio-only stream.
-  /// - Convert to MP3 using FFmpeg (`libmp3lame`).
-  /// - Export to gallery via [Gal.putVideo].
   Future<void> _downloadAudioAsMp3({
     required YoutubeExplode yt,
     required StreamManifest manifest,
@@ -824,122 +989,75 @@ class YoutubeService {
     required void Function(String) onLog,
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
+    void Function(double speed, String eta)? onStats,
+    DetailedProgressCallback? onDetailedProgress,
+    String? playlistName,
   }) async {
-    // Use Muxed stream for audio download to avoid adaptive stream hangs.
-    // We select the lowest quality video to save bandwidth, since we only want audio.
     final muxed = manifest.muxed.sortByBitrate().firstOrNull; // Lowest bitrate
-
     if (muxed == null) {
       throw StateError('No muxed stream found for audio download.');
     }
 
-    onLog(
-      'Selected muxed stream for audio source: ${muxed.videoResolution} @ ${muxed.bitrate.kiloBitsPerSecond.round()} kbps (${muxed.container})',
-    );
+    onLog('Selected muxed stream for audio source: ${muxed.videoResolution} (${muxed.container})');
 
-    final audioTempPath =
-        p.join(baseDir.path, '$baseName.audio_source.${muxed.container.name}');
+    final audioTempPath = p.join(baseDir.path, '$baseName.audio_source.${muxed.container.name}');
     final audioTempFile = File(audioTempPath);
 
-    if (audioTempFile.existsSync()) {
-      await audioTempFile.delete();
-    }
+    if (audioTempFile.existsSync()) await audioTempFile.delete();
 
     final audioStream = yt.videos.streamsClient.get(muxed);
-    await _downloadStreamToFile(
-      stream: audioStream,
-      file: audioTempFile,
-      totalBytes: muxed.size.totalBytes,
-      onLog: onLog,
-      onProgress: onProgress,
-    );
-
-    // Convert to MP3 via FFmpeg INSIDE the temp directory.
-    final mp3Path = p.join(baseDir.path, '$baseName.mp3');
-    final mp3File = File(mp3Path);
-    if (mp3File.existsSync()) {
-      await mp3File.delete();
+    
+    try {
+      await _downloadStreamToFile(
+        stream: audioStream,
+        file: audioTempFile,
+        totalBytes: muxed.size.totalBytes,
+        onLog: onLog,
+        onProgress: (p) {
+          if (onProgress != null) onProgress(p);
+          onDetailedProgress?.call(audioProgress: p, currentAction: 'downloading_audio');
+        },
+        onStats: onStats,
+      );
+    } catch (e) {
+      try {
+        if (audioTempFile.existsSync()) await audioTempFile.delete();
+      } catch (_) {}
+      rethrow;
     }
 
+    if (_isCancelled) throw CancellationException();
+
+    final mp3Path = p.join(baseDir.path, '$baseName.mp3');
+    final mp3File = File(mp3Path);
+    if (mp3File.existsSync()) await mp3File.delete();
+
     onStatus?.call('converting');
+    onDetailedProgress?.call(currentAction: 'converting');
     onLog('Converting audio to MP3 via FFmpeg...');
 
-    // Use libmp3lame for encoding as requested.
-    final ffmpegCommand =
-        '-y -i "${audioTempFile.path}" -vn -codec:a libmp3lame -qscale:a 2 "$mp3Path"';
-
-    onLog('Executing FFmpeg: $ffmpegCommand');
+    final ffmpegCommand = '-y -i "${audioTempFile.path}" -vn -codec:a libmp3lame -qscale:a 2 "$mp3Path"';
     final session = await FFmpegKit.execute(ffmpegCommand);
     final returnCode = await session.getReturnCode();
 
     if (!ReturnCode.isSuccess(returnCode)) {
       final output = await session.getOutput();
-      final failLog = await session.getFailStackTrace();
-      onLog('FFmpeg failed with code $returnCode.\nOutput: $output\nFailLog: $failLog');
-      throw StateError('FFmpeg audio conversion failed.');
+      throw StateError('FFmpeg audio conversion failed: $output');
     }
 
     onLog('MP3 created: $mp3Path');
-
-    // Save to Music folder using MediaStore (Android 13+ compliant)
     onStatus?.call('exporting');
-    onLog('Saving MP3 to Music folder via MediaStore...');
+    onDetailedProgress?.call(currentAction: 'exporting');
+
+    await _saveAudioToMusic(mp3Path, playlistName, onLog);
 
     try {
-      if (Platform.isAndroid) {
-        final mediaStore = MediaStore();
-        await mediaStore.saveFile(
-          tempFilePath: mp3Path,
-          dirType: DirType.audio,
-          dirName: DirName.music,
-          relativePath: 'DownloadVideos_App', // Optional subfolder
-        );
-        onLog('MP3 saved to Music/DownloadVideos_App via MediaStore.');
-      } else {
-        // Fallback for non-Android (if any) or older behavior
-        await Gal.putVideo(mp3Path);
-        onLog('MP3 exported via Gal (non-Android/Older).');
-      }
-    } catch (e) {
-      onLog('MediaStore saving failed: $e');
-      onLog('Attempting direct save to Downloads folder (Android workaround)...');
-
-      try {
-         final downloadsPath = '/storage/emulated/0/Download';
-         final newPath = p.join(downloadsPath, '$baseName.mp3');
-         onLog('Copying to: $newPath');
-
-         if (Platform.isAndroid) {
-           final newFile = await mp3File.copy(newPath);
-           onLog('Success! Saved to: ${newFile.path}');
-         } else {
-           rethrow;
-         }
-      } catch (e2) {
-         onLog('Direct save failed: $e2');
-         onLog('File remains at: $mp3Path');
-         rethrow;
-      }
-    }
-
-    // Best-effort cleanup of intermediate file.
-    try {
-      if (audioTempFile.existsSync()) {
-        await audioTempFile.delete();
-      }
-      // Note: MediaStorePlus usually copies the file.
-      // We might want to keep the temp file or delete it?
-      // Usually temp file should be deleted if successful.
-      // But let's leave mp3File for now in cache just in case.
-    } catch (_) {
-      // Ignore cleanup errors.
-    }
+      if (audioTempFile.existsSync()) await audioTempFile.delete();
+      if (mp3File.existsSync()) await mp3File.delete();
+    } catch (_) {}
   }
 
   /// Mode `merge`:
-  /// - Download best MP4 video-only stream + best M4A audio-only stream.
-  /// - Merge with FFmpeg (`-c:v copy -c:a aac`).
-  /// - Export to gallery via [Gal.putVideo].
   Future<void> _downloadAndMergeBestVideoAndAudio({
     required YoutubeExplode yt,
     required StreamManifest manifest,
@@ -948,42 +1066,24 @@ class YoutubeService {
     required void Function(String) onLog,
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
+    void Function(double speed, String eta)? onStats,
+    DetailedProgressCallback? onDetailedProgress,
+    String? playlistName,
   }) async {
-    // Select the absolute highest quality video stream (MP4 or WebM/VP9)
     final video = manifest.videoOnly.withHighestBitrate();
- 
-    if (video == null) {
-      throw StateError('No suitable video-only stream found.');
-    }
- 
-    // Select the absolute highest quality audio stream
     final audio = manifest.audioOnly.withHighestBitrate();
 
-    if (audio == null) {
-      throw StateError('No suitable audio-only stream found.');
-    }
+    onLog('Selected video: ${video.videoResolution} (${video.container})');
+    onLog('Selected audio: ${audio.codec} (${audio.container})');
 
-    onLog(
-      'Selected video: ${video.videoResolution} @ ${video.bitrate.kiloBitsPerSecond.round()} kbps (${video.container})',
-    );
-    onLog(
-      'Selected audio: ${audio.codec} @ ${audio.bitrate.kiloBitsPerSecond.round()} kbps (${audio.container})',
-    );
-
-    final videoPath =
-        p.join(baseDir.path, '$baseName.video.${video.container.name}');
-    final audioPath =
-        p.join(baseDir.path, '$baseName.audio.${audio.container.name}');
+    final videoPath = p.join(baseDir.path, '$baseName.video.${video.container.name}');
+    final audioPath = p.join(baseDir.path, '$baseName.audio.${audio.container.name}');
 
     final videoFile = File(videoPath);
     final audioFile = File(audioPath);
 
-    if (videoFile.existsSync()) {
-      await videoFile.delete();
-    }
-    if (audioFile.existsSync()) {
-      await audioFile.delete();
-    }
+    if (videoFile.existsSync()) await videoFile.delete();
+    if (audioFile.existsSync()) await audioFile.delete();
 
     final videoStream = yt.videos.streamsClient.get(video);
     final audioStream = yt.videos.streamsClient.get(audio);
@@ -1005,8 +1105,12 @@ class YoutubeService {
           if (onProgress != null && totalExpectedBytes > 0) {
             onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
           }
+          onDetailedProgress?.call(videoProgress: p, currentAction: 'downloading_video');
         },
+        onStats: onStats,
       );
+
+      if (_isCancelled) throw CancellationException();
 
       await _downloadStreamToFile(
         stream: audioStream,
@@ -1018,19 +1122,23 @@ class YoutubeService {
           if (onProgress != null && totalExpectedBytes > 0) {
             onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
           }
+          onDetailedProgress?.call(audioProgress: p, currentAction: 'downloading_audio');
         },
+        onStats: onStats,
       );
     } catch (e) {
-      onLog('Adaptive stream download failed: $e');
-      onLog('Falling back to "Muxed" (Fast) strategy to ensure download completion...');
-
-      // Clean up partial files
       try {
         if (videoFile.existsSync()) await videoFile.delete();
         if (audioFile.existsSync()) await audioFile.delete();
       } catch (_) {}
+      
+      if (e is CancellationException) {
+        rethrow;
+      }
 
-      // Fallback: Download Muxed stream directly
+      onLog('Adaptive stream download failed: $e');
+      onLog('Falling back to "Muxed" (Fast) strategy to ensure download completion...');
+
       await _downloadMuxed(
         yt: yt,
         manifest: manifest,
@@ -1039,56 +1147,46 @@ class YoutubeService {
         onLog: onLog,
         onProgress: onProgress,
         onStatus: onStatus,
+        onStats: onStats,
+        onDetailedProgress: onDetailedProgress,
+        playlistName: playlistName,
       );
-      return; // Stop merge execution
+      return;
     }
 
-    // Merge inside temp directory.
+    if (_isCancelled) throw CancellationException();
+
     final outputPath = p.join(baseDir.path, '$baseName.merged.mp4');
     final outputFile = File(outputPath);
-    if (outputFile.existsSync()) {
-      await outputFile.delete();
-    }
+    if (outputFile.existsSync()) await outputFile.delete();
 
     onStatus?.call('converting');
+    onDetailedProgress?.call(currentAction: 'converting');
     onLog('Merging video and audio via FFmpeg...');
 
-    final ffmpegCommand =
-        '-y -i "${videoFile.path}" -i "${audioFile.path}" -c:v copy -c:a aac "$outputPath"';
-
+    final ffmpegCommand = '-y -i "${videoFile.path}" -i "${audioFile.path}" -c:v copy -c:a aac "$outputPath"';
     final session = await FFmpegKit.execute(ffmpegCommand);
     final returnCode = await session.getReturnCode();
 
     if (!ReturnCode.isSuccess(returnCode)) {
       final output = await session.getOutput();
-      onLog('FFmpeg failed with code $returnCode. Output:\n$output');
-      throw StateError('FFmpeg merge failed.');
+      throw StateError('FFmpeg merge failed: $output');
     }
 
     onLog('Merged file created: $outputPath');
-
     onStatus?.call('exporting');
-    onLog('Saving merged video to gallery via Gal.putVideo...');
-    await Gal.putVideo(outputPath);
-    onLog('Merged video exported to gallery.');
+    onDetailedProgress?.call(currentAction: 'exporting');
 
-    // Best-effort cleanup of intermediate files.
+    await _saveVideoToGallery(outputPath, playlistName, onLog);
+
     try {
-      if (videoFile.existsSync()) {
-        await videoFile.delete();
-      }
-      if (audioFile.existsSync()) {
-        await audioFile.delete();
-      }
-    } catch (_) {
-      // Ignore cleanup errors.
-    }
+      if (videoFile.existsSync()) await videoFile.delete();
+      if (audioFile.existsSync()) await audioFile.delete();
+      if (outputFile.existsSync()) await outputFile.delete();
+    } catch (_) {}
   }
 
   /// Mode `muxed`:
-  /// - Download best muxed stream from `manifest.muxed`.
-  /// - Save directly (no FFmpeg processing).
-  /// - Export to gallery via [Gal.putVideo].
   Future<void> _downloadMuxed({
     required YoutubeExplode yt,
     required StreamManifest manifest,
@@ -1097,39 +1195,49 @@ class YoutubeService {
     required void Function(String) onLog,
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
+    void Function(double speed, String eta)? onStats,
+    DetailedProgressCallback? onDetailedProgress,
+    String? playlistName,
   }) async {
     final muxed = manifest.muxed.withHighestBitrate();
 
-    if (muxed == null) {
-      throw StateError('No muxed stream available for this video.');
-    }
+    onLog('Selected muxed: ${muxed.videoResolution} (${muxed.container})');
 
-    onLog(
-      'Selected muxed: ${muxed.videoResolution} @ ${muxed.bitrate.kiloBitsPerSecond.round()} kbps (${muxed.container})',
-    );
-
-    final muxedPath =
-        p.join(baseDir.path, '$baseName.muxed.${muxed.container.name}');
+    final muxedPath = p.join(baseDir.path, '$baseName.muxed.${muxed.container.name}');
     final muxedFile = File(muxedPath);
 
-    if (muxedFile.existsSync()) {
-      await muxedFile.delete();
-    }
+    if (muxedFile.existsSync()) await muxedFile.delete();
 
     final muxedStream = yt.videos.streamsClient.get(muxed);
 
-    await _downloadStreamToFile(
-      stream: muxedStream,
-      file: muxedFile,
-      totalBytes: muxed.size.totalBytes,
-      onLog: onLog,
-      onProgress: onProgress,
-    );
+    try {
+      await _downloadStreamToFile(
+        stream: muxedStream,
+        file: muxedFile,
+        totalBytes: muxed.size.totalBytes,
+        onLog: onLog,
+        onProgress: (p) {
+          if (onProgress != null) onProgress(p);
+          onDetailedProgress?.call(videoProgress: p, currentAction: 'downloading_video');
+        },
+        onStats: onStats,
+      );
+    } catch (e) {
+      try {
+        if (muxedFile.existsSync()) await muxedFile.delete();
+      } catch (_) {}
+      rethrow;
+    }
+
+    if (_isCancelled) throw CancellationException();
 
     onStatus?.call('exporting');
-    onLog('Saving muxed video to gallery via Gal.putVideo...');
-    await Gal.putVideo(muxedPath);
-    onLog('Muxed video exported to gallery.');
+    onDetailedProgress?.call(currentAction: 'exporting');
+    await _saveVideoToGallery(muxedPath, playlistName, onLog);
+
+    try {
+      if (muxedFile.existsSync()) await muxedFile.delete();
+    } catch (_) {}
   }
 
   Future<YoutubeAnalysis> _fetchMetadataViaIosApi(String videoId) async {
@@ -1166,7 +1274,6 @@ class YoutubeService {
     }
 
     final json = jsonDecode(response.body) as Map<String, dynamic>;
-    
     final playabilityStatus = json['playabilityStatus'] as Map<String, dynamic>?;
     if (playabilityStatus != null && playabilityStatus['status'] == 'ERROR') {
       throw StateError(playabilityStatus['reason'] ?? 'Video is unavailable');
@@ -1228,26 +1335,24 @@ class ConfiguredHttpClient extends http.BaseClient {
 }
 
 class CustomYoutubeHttpClient extends YoutubeHttpClient {
-  CustomYoutubeHttpClient([http.Client? httpClient]) : super(httpClient);
+  final YoutubeService _service;
+  CustomYoutubeHttpClient([http.Client? httpClient, YoutubeService? service]) 
+      : _service = service ?? YoutubeService(SettingsService()),
+        super(httpClient);
 
   void customValidateResponse(http.BaseResponse response, int statusCode) {
     if (closed) return;
-
     final request = response.request!;
 
-    if (request.url.host.endsWith('.google.com') &&
-        request.url.path.startsWith('/sorry/')) {
+    if (request.url.host.endsWith('.google.com') && request.url.path.startsWith('/sorry/')) {
       throw RequestLimitExceededException.httpRequest(response);
     }
-
     if (statusCode >= 500) {
       throw TransientFailureException.httpRequest(response);
     }
-
     if (statusCode == 429) {
       throw RequestLimitExceededException.httpRequest(response);
     }
-
     if (statusCode >= 400) {
       throw FatalFailureException.httpRequest(response);
     }
@@ -1323,6 +1428,10 @@ class CustomYoutubeHttpClient extends YoutubeHttpClient {
     int consecutiveRefreshes = 0;
 
     while (!closed && bytesCount < streamInfo.size.totalBytes) {
+      if (_service.isCancelled) {
+        throw CancellationException();
+      }
+
       try {
         final response = await _retry(() async {
           final from = bytesCount;
@@ -1407,4 +1516,3 @@ class CustomYoutubeHttpClient extends YoutubeHttpClient {
     }
   }
 }
-
