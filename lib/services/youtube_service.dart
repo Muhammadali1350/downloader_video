@@ -19,12 +19,68 @@ class YoutubeAnalysis {
     required this.author,
     required this.duration,
     required this.thumbnailUrl,
+    required this.formats,
+    this.playlist,
   });
 
   final String title;
   final String author;
   final Duration? duration;
   final String thumbnailUrl;
+  final List<YoutubeStreamFormat> formats;
+  final YoutubePlaylistAnalysis? playlist;
+}
+
+class YoutubePlaylistAnalysis {
+  final String id;
+  final String title;
+  final String author;
+  final int videoCount;
+  final List<YoutubePlaylistVideo> videos;
+
+  YoutubePlaylistAnalysis({
+    required this.id,
+    required this.title,
+    required this.author,
+    required this.videoCount,
+    required this.videos,
+  });
+}
+
+class YoutubePlaylistVideo {
+  final String id;
+  final String title;
+  final String author;
+  final Duration? duration;
+  final String thumbnailUrl;
+
+  YoutubePlaylistVideo({
+    required this.id,
+    required this.title,
+    required this.author,
+    required this.duration,
+    required this.thumbnailUrl,
+  });
+}
+
+class YoutubeStreamFormat {
+  final int tag;
+  final String type; // 'video_only', 'audio_only', 'muxed'
+  final String container; // 'mp4', 'webm', etc.
+  final String qualityLabel; // '1080p', '720p', '128 kbps', etc.
+  final double sizeMb;
+  final int bitrateKbps;
+  final String codec;
+
+  YoutubeStreamFormat({
+    required this.tag,
+    required this.type,
+    required this.container,
+    required this.qualityLabel,
+    required this.sizeMb,
+    required this.bitrateKbps,
+    required this.codec,
+  });
 }
 
 /// Core YouTube download / processing logic.
@@ -56,41 +112,156 @@ class YoutubeService {
       userAgent: settings.userAgent,
       cookies: settings.cookies,
     );
-    final yt = YoutubeExplode(httpClient: YoutubeHttpClient(client));
+    final customClient = CustomYoutubeHttpClient(client);
+    final yt = YoutubeExplode(httpClient: customClient);
 
     try {
+      final trimmedUrl = url.trim();
       onLog('Analyzing URL...');
-      final videoId = VideoId(url.trim());
-      
-      YoutubeAnalysis analysis;
-      try {
-        final video = await yt.videos.get(videoId);
-        onLog('Title: ${video.title}');
-        onLog('Channel: ${video.author}');
-        if (video.duration != null) {
-          onLog('Duration: ${video.duration}');
-        }
-        final thumbnailUrl =
-            video.thumbnails.highResUrl ?? video.thumbnails.standardResUrl;
 
-        analysis = YoutubeAnalysis(
-          title: video.title,
-          author: video.author,
-          duration: video.duration,
-          thumbnailUrl: thumbnailUrl,
-        );
+      YoutubePlaylistAnalysis? playlistAnalysis;
+      PlaylistId? playlistId;
+      try {
+        if (trimmedUrl.contains('list=')) {
+          playlistId = PlaylistId(trimmedUrl);
+        }
       } catch (e) {
-        onLog('Standard analyze failed: $e. Using fallback iOS API...');
-        analysis = await _fetchMetadataViaIosApi(videoId.value);
-        onLog('Fallback success!');
-        onLog('Title: ${analysis.title}');
-        onLog('Channel: ${analysis.author}');
-        if (analysis.duration != null) {
-          onLog('Duration: ${analysis.duration}');
+        onLog('Could not parse playlist ID: $e');
+      }
+
+      if (playlistId != null) {
+        onLog('Fetching playlist details...');
+        try {
+          final playlist = await yt.playlists.get(playlistId);
+          final videosStream = yt.playlists.getVideos(playlistId);
+          final videosList = <YoutubePlaylistVideo>[];
+          
+          await for (final video in videosStream) {
+            videosList.add(YoutubePlaylistVideo(
+              id: video.id.value,
+              title: video.title,
+              author: video.author,
+              duration: video.duration,
+              thumbnailUrl: video.thumbnails.highResUrl ?? video.thumbnails.standardResUrl,
+            ));
+          }
+          
+          playlistAnalysis = YoutubePlaylistAnalysis(
+            id: playlistId.value,
+            title: playlist.title.isNotEmpty ? playlist.title : 'Плейлист',
+            author: playlist.author.isNotEmpty ? playlist.author : 'Неизвестно',
+            videoCount: playlist.videoCount ?? videosList.length,
+            videos: videosList,
+          );
+          onLog('Playlist parsed successfully with ${videosList.length} videos.');
+        } catch (e) {
+          onLog('Failed to load playlist: $e');
         }
       }
 
-      return analysis;
+      VideoId? videoId;
+      try {
+        videoId = VideoId(trimmedUrl);
+      } catch (_) {
+        if (playlistAnalysis != null && playlistAnalysis.videos.isNotEmpty) {
+          videoId = VideoId(playlistAnalysis.videos.first.id);
+        }
+      }
+
+      if (videoId == null) {
+        if (playlistAnalysis != null) {
+          throw ArgumentError('В плейлисте не найдено видео для анализа.');
+        } else {
+          throw ArgumentError('Неверная ссылка. Не удалось распознать видео или плейлист.');
+        }
+      }
+      
+      String title = 'Unknown Video';
+      String author = 'Unknown Channel';
+      Duration? duration;
+      String thumbnailUrl = 'https://img.youtube.com/vi/${videoId.value}/0.jpg';
+
+      try {
+        final video = await yt.videos.get(videoId);
+        title = video.title;
+        author = video.author;
+        duration = video.duration;
+        thumbnailUrl = video.thumbnails.highResUrl ?? video.thumbnails.standardResUrl;
+      } catch (e) {
+        onLog('Metadata fetch failed: $e. Using fallback iOS API...');
+        final fallbackDetails = await _fetchMetadataViaIosApi(videoId.value);
+        title = fallbackDetails.title;
+        author = fallbackDetails.author;
+        duration = fallbackDetails.duration;
+        thumbnailUrl = fallbackDetails.thumbnailUrl;
+      }
+
+      onLog('Fetching available formats...');
+      StreamManifest? manifest;
+      try {
+        manifest = await yt.videos.streamsClient.getManifest(
+          videoId,
+          requireWatchPage: true,
+          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+        );
+      } catch (e) {
+        onLog('Failed to get manifest with watch page: $e. Using fallback manifest...');
+        try {
+          manifest = await yt.videos.streamsClient.getManifest(
+            videoId,
+            requireWatchPage: false,
+            ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+          );
+        } catch (e2) {
+          onLog('Failed fallback manifest: $e2');
+        }
+      }
+
+      final List<YoutubeStreamFormat> formatsList = [];
+      if (manifest != null) {
+        for (final stream in manifest.videoOnly) {
+          formatsList.add(YoutubeStreamFormat(
+            tag: stream.tag,
+            type: 'video_only',
+            container: stream.container.name,
+            qualityLabel: stream.qualityLabel,
+            sizeMb: stream.size.totalBytes / (1024 * 1024),
+            bitrateKbps: stream.bitrate.kiloBitsPerSecond.round(),
+            codec: stream.videoCodec,
+          ));
+        }
+        for (final stream in manifest.audioOnly) {
+          formatsList.add(YoutubeStreamFormat(
+            tag: stream.tag,
+            type: 'audio_only',
+            container: stream.container.name,
+            qualityLabel: stream.qualityLabel,
+            sizeMb: stream.size.totalBytes / (1024 * 1024),
+            bitrateKbps: stream.bitrate.kiloBitsPerSecond.round(),
+            codec: stream.audioCodec,
+          ));
+        }
+        for (final stream in manifest.muxed) {
+          formatsList.add(YoutubeStreamFormat(
+            tag: stream.tag,
+            type: 'muxed',
+            container: stream.container.name,
+            qualityLabel: stream.qualityLabel,
+            sizeMb: stream.size.totalBytes / (1024 * 1024),
+            bitrateKbps: stream.bitrate.kiloBitsPerSecond.round(),
+            codec: '${stream.videoCodec} / ${stream.audioCodec}',
+          ));
+        }
+      }
+
+      return YoutubeAnalysis(
+        title: title,
+        author: author,
+        duration: duration,
+        thumbnailUrl: thumbnailUrl,
+        formats: formatsList,
+        playlist: playlistAnalysis,
+      );
     } finally {
       yt.close();
     }
@@ -210,6 +381,308 @@ class YoutubeService {
             'mode',
             'Unsupported mode. Expected one of: $modeAudio, $modeMerge, $modeMuxed.',
           );
+      }
+
+      setStatus('done');
+      log('Done.');
+    } catch (e, stackTrace) {
+      setStatus('error');
+      log('Error: $e');
+      log(stackTrace.toString());
+      rethrow;
+    } finally {
+      yt.close();
+    }
+  }
+
+  /// Download multiple videos in a playlist sequentially.
+  Future<void> downloadPlaylist({
+    required List<String> videoIds,
+    required String mode,
+    required void Function(String) onLog,
+    required void Function(double progress) onProgress,
+    required void Function(String status) onStatus,
+  }) async {
+    void log(String message) => onLog(message);
+    log('Начало загрузки плейлиста: ${videoIds.length} видео в режиме "$mode"...');
+    
+    int successfulDownloads = 0;
+
+    for (int i = 0; i < videoIds.length; i++) {
+      final videoId = videoIds[i];
+      final videoUrl = 'https://www.youtube.com/watch?v=$videoId';
+      log('-----------------------------------------');
+      log('Загрузка ${i + 1} из ${videoIds.length}: $videoUrl');
+      
+      try {
+        await downloadVideo(
+          videoUrl,
+          mode: mode,
+          onLog: (msg) => log('[Видео ${i + 1}] $msg'),
+          onProgress: (p) {
+            final overallProgress = (i + p) / videoIds.length;
+            onProgress(overallProgress);
+          },
+          onStatus: (status) {
+             onStatus('downloading'); // Keep status as downloading during the playlist loop
+          },
+        );
+        successfulDownloads++;
+        log('Успешно загружено видео ${i + 1} из ${videoIds.length}');
+      } catch (e) {
+        log('Ошибка при загрузке видео ${i + 1}: $e');
+      }
+    }
+    
+    onProgress(1.0);
+    onStatus('done');
+    log('Загрузка плейлиста завершена. Успешно загружено: $successfulDownloads из ${videoIds.length} видео.');
+  }
+
+  /// Download custom selected video and/or audio stream formats.
+  Future<void> downloadCustomFormat({
+    required String url,
+    required int? videoTag,
+    required int? audioTag,
+    required void Function(String) onLog,
+    void Function(double progress)? onProgress,
+    void Function(String status)? onStatus,
+  }) async {
+    final settings = await _settingsService.loadSettings();
+    final client = ConfiguredHttpClient(
+      userAgent: settings.userAgent,
+      cookies: settings.cookies,
+    );
+    final customClient = CustomYoutubeHttpClient(client);
+    final yt = YoutubeExplode(httpClient: customClient);
+
+    void log(String message) {
+      onLog(message);
+    }
+
+    void setStatus(String status) {
+      if (onStatus != null) {
+        onStatus(status);
+      }
+    }
+
+    try {
+      log('Parsing URL...');
+      final videoId = VideoId(url.trim());
+
+      setStatus('downloading');
+
+      log('Fetching video details...');
+      String title;
+      try {
+        final video = await yt.videos.get(videoId);
+        title = video.title;
+      } catch (e) {
+        log('Standard fetch details failed: $e. Using fallback iOS API...');
+        final fallbackDetails = await _fetchMetadataViaIosApi(videoId.value);
+        title = fallbackDetails.title;
+      }
+
+      StreamManifest manifest;
+      try {
+        log('Fetching stream manifest (with watch page)...');
+        manifest = await yt.videos.streamsClient.getManifest(
+          videoId,
+          requireWatchPage: true,
+          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+        );
+      } catch (e) {
+        log('Failed to fetch manifest with watch page: $e. Using fallback player-only manifest...');
+        manifest = await yt.videos.streamsClient.getManifest(
+          videoId,
+          requireWatchPage: false,
+          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+        );
+      }
+
+      final tempDir = await getTemporaryDirectory();
+      final safeTitle = _sanitizeFileName(title);
+
+      log('Resolved video: "$title"');
+      log('Using temporary directory: ${tempDir.path}');
+
+      if (videoTag != null && audioTag != null) {
+        // Mode: Merge custom video + custom audio
+        final video = manifest.streams.firstWhere((e) => e.tag == videoTag) as VideoStreamInfo;
+        final audio = manifest.streams.firstWhere((e) => e.tag == audioTag) as AudioStreamInfo;
+
+        log('Selected video: ${video.videoResolution} @ ${video.bitrate.kiloBitsPerSecond.round()} kbps (${video.container})');
+        log('Selected audio: ${audio.codec} @ ${audio.bitrate.kiloBitsPerSecond.round()} kbps (${audio.container})');
+
+        final videoPath = p.join(tempDir.path, '$safeTitle.video.${video.container.name}');
+        final audioPath = p.join(tempDir.path, '$safeTitle.audio.${audio.container.name}');
+
+        final videoFile = File(videoPath);
+        final audioFile = File(audioPath);
+
+        if (videoFile.existsSync()) await videoFile.delete();
+        if (audioFile.existsSync()) await audioFile.delete();
+
+        final videoStream = yt.videos.streamsClient.get(video);
+        final audioStream = yt.videos.streamsClient.get(audio);
+
+        var videoBytesDownloaded = 0;
+        var audioBytesDownloaded = 0;
+        final totalExpectedBytes = video.size.totalBytes + audio.size.totalBytes;
+
+        await _downloadStreamToFile(
+          stream: videoStream,
+          file: videoFile,
+          totalBytes: video.size.totalBytes,
+          onLog: log,
+          onProgress: (p) {
+            videoBytesDownloaded = (p * video.size.totalBytes).round();
+            if (onProgress != null && totalExpectedBytes > 0) {
+              onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
+            }
+          },
+        );
+
+        await _downloadStreamToFile(
+          stream: audioStream,
+          file: audioFile,
+          totalBytes: audio.size.totalBytes,
+          onLog: log,
+          onProgress: (p) {
+            audioBytesDownloaded = (p * audio.size.totalBytes).round();
+            if (onProgress != null && totalExpectedBytes > 0) {
+              onProgress((videoBytesDownloaded + audioBytesDownloaded) / totalExpectedBytes);
+            }
+          },
+        );
+
+        final outputPath = p.join(tempDir.path, '$safeTitle.merged.mp4');
+        final outputFile = File(outputPath);
+        if (outputFile.existsSync()) await outputFile.delete();
+
+        setStatus('converting');
+        log('Merging video and audio via FFmpeg...');
+
+        final ffmpegCommand = '-y -i "${videoFile.path}" -i "${audioFile.path}" -c:v copy -c:a aac "$outputPath"';
+        final session = await FFmpegKit.execute(ffmpegCommand);
+        final returnCode = await session.getReturnCode();
+
+        if (!ReturnCode.isSuccess(returnCode)) {
+          final output = await session.getOutput();
+          log('FFmpeg failed with code $returnCode. Output:\n$output');
+          throw StateError('FFmpeg merge failed.');
+        }
+
+        log('Merged file created: $outputPath');
+        setStatus('exporting');
+        log('Saving merged video to gallery via Gal.putVideo...');
+        await Gal.putVideo(outputPath);
+        log('Merged video exported to gallery.');
+
+        try {
+          if (videoFile.existsSync()) await videoFile.delete();
+          if (audioFile.existsSync()) await audioFile.delete();
+        } catch (_) {}
+      } else if (videoTag != null) {
+        // Mode: Only Video
+        final video = manifest.streams.firstWhere((e) => e.tag == videoTag) as VideoStreamInfo;
+        log('Selected video: ${video.videoResolution} (${video.container})');
+
+        final videoPath = p.join(tempDir.path, '$safeTitle.${video.container.name}');
+        final videoFile = File(videoPath);
+        if (videoFile.existsSync()) await videoFile.delete();
+
+        final videoStream = yt.videos.streamsClient.get(video);
+
+        await _downloadStreamToFile(
+          stream: videoStream,
+          file: videoFile,
+          totalBytes: video.size.totalBytes,
+          onLog: log,
+          onProgress: onProgress,
+        );
+
+        setStatus('exporting');
+        log('Saving video to gallery via Gal.putVideo...');
+        await Gal.putVideo(videoPath);
+        log('Video exported to gallery.');
+      } else if (audioTag != null) {
+        // Mode: Only Audio (MP3)
+        final audio = manifest.streams.firstWhere((e) => e.tag == audioTag) as AudioStreamInfo;
+        log('Selected audio: ${audio.codec} (${audio.container})');
+
+        final audioPath = p.join(tempDir.path, '$safeTitle.audio_source.${audio.container.name}');
+        final audioFile = File(audioPath);
+        if (audioFile.existsSync()) await audioFile.delete();
+
+        final audioStream = yt.videos.streamsClient.get(audio);
+
+        await _downloadStreamToFile(
+          stream: audioStream,
+          file: audioFile,
+          totalBytes: audio.size.totalBytes,
+          onLog: log,
+          onProgress: onProgress,
+        );
+
+        setStatus('converting');
+        final mp3Path = p.join(tempDir.path, '$safeTitle.mp3');
+        final mp3File = File(mp3Path);
+        if (mp3File.existsSync()) await mp3File.delete();
+
+        log('Converting to MP3 via FFmpeg...');
+        final ffmpegCommand = '-y -i "${audioFile.path}" -qscale:a 2 "$mp3Path"';
+        final session = await FFmpegKit.execute(ffmpegCommand);
+        final returnCode = await session.getReturnCode();
+
+        if (!ReturnCode.isSuccess(returnCode)) {
+          final output = await session.getOutput();
+          log('FFmpeg conversion failed: $output');
+          throw StateError('FFmpeg conversion failed.');
+        }
+
+        log('MP3 created: $mp3Path');
+        setStatus('exporting');
+        log('Saving MP3 to Music folder via MediaStore...');
+
+        try {
+          if (Platform.isAndroid) {
+            final mediaStore = MediaStore();
+            await mediaStore.saveFile(
+              tempFilePath: mp3Path,
+              dirType: DirType.audio,
+              dirName: DirName.music,
+              relativePath: 'DownloadVideos_App',
+            );
+            log('MP3 saved to Music/DownloadVideos_App via MediaStore.');
+          } else {
+            await Gal.putVideo(mp3Path);
+            log('MP3 exported via Gal.');
+          }
+        } catch (e) {
+          log('MediaStore saving failed: $e');
+          log('Attempting direct save to Downloads folder...');
+          try {
+            final downloadsPath = '/storage/emulated/0/Download';
+            final newPath = p.join(downloadsPath, '$safeTitle.mp3');
+            log('Copying to: $newPath');
+            if (Platform.isAndroid) {
+              final newFile = await mp3File.copy(newPath);
+              log('Success! Saved to: ${newFile.path}');
+            } else {
+              rethrow;
+            }
+          } catch (e2) {
+            log('Direct save failed: $e2');
+            log('File remains at: $mp3Path');
+            rethrow;
+          }
+        }
+
+        try {
+          if (audioFile.existsSync()) await audioFile.delete();
+          if (mp3File.existsSync()) await mp3File.delete();
+        } catch (_) {}
       }
 
       setStatus('done');
@@ -702,6 +1175,8 @@ class YoutubeService {
       author: author,
       duration: duration,
       thumbnailUrl: thumbnailUrl,
+      formats: const [],
+      playlist: null,
     );
   }
 }

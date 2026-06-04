@@ -21,6 +21,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool _isAnalyzing = false;
   bool _isWorking = false;
   YoutubeAnalysis? _analysis;
+  bool _showPlaylistMode = false;
+  final Set<String> _selectedPlaylistVideoIds = {};
 
   @override
   void initState() {
@@ -84,6 +86,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       setState(() {
         _analysis = analysis;
         _hasAnalysis = true;
+        _showPlaylistMode = analysis.playlist != null;
+        _selectedPlaylistVideoIds.clear();
+        if (analysis.playlist != null) {
+          _selectedPlaylistVideoIds.addAll(analysis.playlist!.videos.map((v) => v.id));
+        }
       });
     } catch (e) {
       _appendLog('Analyze failed: $e');
@@ -156,6 +163,136 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         });
       }
     }
+  }
+
+  Future<void> _startCustomDownload(int? videoTag, int? audioTag) async {
+    final rawUrl = _urlController.text.trim();
+    if (rawUrl.isEmpty) return;
+
+    setState(() {
+      _isWorking = true;
+    });
+
+    ref.read(progressProvider.notifier).set(0.0);
+    _appendLog('--- Starting custom download (Video: $videoTag, Audio: $audioTag) ---');
+
+    final service = ref.read(youtubeServiceProvider);
+    final progressNotifier = ref.read(progressProvider.notifier);
+    final statusNotifier = ref.read(statusProvider.notifier);
+
+    try {
+      await service.downloadCustomFormat(
+        url: rawUrl,
+        videoTag: videoTag,
+        audioTag: audioTag,
+        onLog: _appendLog,
+        onProgress: (value) {
+          progressNotifier.set(value);
+        },
+        onStatus: (status) {
+          statusNotifier.set(status);
+        },
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Готово. Успешно сохранено.')),
+        );
+      }
+    } catch (e) {
+      _appendLog('Download failed: $e');
+      statusNotifier.set('error');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Download failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isWorking = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _startPlaylistDownload(String mode) async {
+    if (_analysis == null || _analysis!.playlist == null) return;
+    final selectedIds = _analysis!.playlist!.videos
+        .map((v) => v.id)
+        .where((id) => _selectedPlaylistVideoIds.contains(id))
+        .toList();
+
+    if (selectedIds.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Пожалуйста, выберите хотя бы одно видео для загрузки.')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isWorking = true;
+    });
+
+    ref.read(progressProvider.notifier).set(0.0);
+    _appendLog('--- Starting playlist download (Mode: $mode, Videos: ${selectedIds.length}) ---');
+
+    final service = ref.read(youtubeServiceProvider);
+    final progressNotifier = ref.read(progressProvider.notifier);
+    final statusNotifier = ref.read(statusProvider.notifier);
+
+    try {
+      await service.downloadPlaylist(
+        videoIds: selectedIds,
+        mode: mode,
+        onLog: _appendLog,
+        onProgress: (value) {
+          progressNotifier.set(value);
+        },
+        onStatus: (status) {
+          statusNotifier.set(status);
+        },
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Загрузка плейлиста завершена.')),
+        );
+      }
+    } catch (e) {
+      _appendLog('Playlist download failed: $e');
+      statusNotifier.set('error');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Playlist download failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isWorking = false;
+        });
+      }
+    }
+  }
+
+  void _showFormatSelectionSheet(BuildContext context) {
+    if (_analysis == null) return;
+    
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return SizedBox(
+          height: MediaQuery.of(context).size.height * 0.8,
+          child: FormatSelectionSheet(
+            analysis: _analysis!,
+            onDownload: _startCustomDownload,
+          ),
+        );
+      },
+    );
   }
 
   Future<void> _showSettingsDialog(BuildContext context) async {
@@ -479,8 +616,179 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
+  Widget _buildToggleRow() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      height: 38,
+      decoration: BoxDecoration(
+        color: const Color(0xFF0F111A),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF1F2335)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: GestureDetector(
+              onTap: () => setState(() => _showPlaylistMode = false),
+              child: Container(
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: !_showPlaylistMode ? Colors.deepPurpleAccent : Colors.transparent,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.movie_creation_rounded,
+                      size: 16,
+                      color: !_showPlaylistMode ? Colors.white : Colors.grey,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Видео',
+                      style: TextStyle(
+                        color: !_showPlaylistMode ? Colors.white : Colors.grey,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: GestureDetector(
+              onTap: () => setState(() => _showPlaylistMode = true),
+              child: Container(
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: _showPlaylistMode ? Colors.deepPurpleAccent : Colors.transparent,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.featured_play_list_rounded,
+                      size: 16,
+                      color: _showPlaylistMode ? Colors.white : Colors.grey,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Плейлист',
+                      style: TextStyle(
+                        color: _showPlaylistMode ? Colors.white : Colors.grey,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPlaylistVideosList(YoutubePlaylistAnalysis playlist) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              'Выбрано: ${_selectedPlaylistVideoIds.length} из ${playlist.videos.length}',
+              style: const TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.w600),
+            ),
+            TextButton(
+              style: TextButton.styleFrom(
+                padding: EdgeInsets.zero,
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              onPressed: () {
+                setState(() {
+                  if (_selectedPlaylistVideoIds.length == playlist.videos.length) {
+                    _selectedPlaylistVideoIds.clear();
+                  } else {
+                    _selectedPlaylistVideoIds.clear();
+                    _selectedPlaylistVideoIds.addAll(playlist.videos.map((v) => v.id));
+                  }
+                });
+              },
+              child: Text(
+                _selectedPlaylistVideoIds.length == playlist.videos.length
+                    ? 'Снять все'
+                    : 'Выбрать все',
+                style: const TextStyle(fontSize: 12, color: Colors.deepPurpleAccent, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Container(
+          height: 160,
+          decoration: BoxDecoration(
+            color: const Color(0xFF07090E),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: const Color(0xFF161A26)),
+          ),
+          child: Scrollbar(
+            thumbVisibility: true,
+            child: ListView.builder(
+              itemCount: playlist.videos.length,
+              itemBuilder: (context, idx) {
+                final video = playlist.videos[idx];
+                final isSelected = _selectedPlaylistVideoIds.contains(video.id);
+                return CheckboxListTile(
+                  value: isSelected,
+                  activeColor: Colors.deepPurpleAccent,
+                  title: Text(
+                    video.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                  ),
+                  subtitle: Text(
+                    '${video.author}${video.duration != null ? " • ${_formatDuration(video.duration!)}" : ""}',
+                    style: TextStyle(color: Colors.grey.shade400, fontSize: 11),
+                  ),
+                  onChanged: (val) {
+                    setState(() {
+                      if (val == true) {
+                        _selectedPlaylistVideoIds.add(video.id);
+                      } else {
+                        _selectedPlaylistVideoIds.remove(video.id);
+                      }
+                    });
+                  },
+                  controlAffinity: ListTileControlAffinity.leading,
+                  dense: true,
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _formatDuration(Duration d) {
+    final minutes = d.inMinutes;
+    final seconds = d.inSeconds % 60;
+    return '$minutes:${seconds.toString().padLeft(2, "0")}';
+  }
+
   Widget _buildAnalysisCard(ColorScheme colorScheme) {
     final data = _analysis!;
+    final hasPlaylist = data.playlist != null;
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(14),
@@ -499,33 +807,57 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            data.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 16,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            data.author,
-            style: TextStyle(
-              color: Colors.grey.shade400,
-              fontSize: 13,
-            ),
-          ),
-          if (data.duration != null) ...[
-            const SizedBox(height: 6),
+          if (hasPlaylist) _buildToggleRow(),
+          if (_showPlaylistMode && data.playlist != null) ...[
             Text(
-              'Duration: ${data.duration}',
-              style: TextStyle(
-                color: Colors.grey.shade500,
-                fontSize: 12,
+              data.playlist!.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
               ),
             ),
+            const SizedBox(height: 4),
+            Text(
+              'Плейлист • Автор: ${data.playlist!.author}',
+              style: TextStyle(
+                color: Colors.grey.shade400,
+                fontSize: 13,
+              ),
+            ),
+            const SizedBox(height: 8),
+            _buildPlaylistVideosList(data.playlist!),
+          ] else ...[
+            Text(
+              data.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              data.author,
+              style: TextStyle(
+                color: Colors.grey.shade400,
+                fontSize: 13,
+              ),
+            ),
+            if (data.duration != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                'Duration: ${data.duration}',
+                style: TextStyle(
+                  color: Colors.grey.shade500,
+                  fontSize: 12,
+                ),
+              ),
+            ],
           ],
         ],
       ),
@@ -533,39 +865,104 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Widget _buildActionButtonsRow(ColorScheme colorScheme) {
-    return Row(
+    if (_showPlaylistMode && _analysis?.playlist != null) {
+      return Row(
+        children: [
+          Expanded(
+            child: _ActionButton(
+              label: 'Playlist MP3',
+              icon: Icons.music_note_rounded,
+              color: const Color(0xFF1E1E2E),
+              onTap: _isWorking
+                  ? null
+                  : () => _startPlaylistDownload(YoutubeService.modeAudio),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _ActionButton(
+              label: 'Playlist Best',
+              icon: Icons.high_quality_rounded,
+              color: const Color(0xFF1E1E2E),
+              onTap: _isWorking
+                  ? null
+                  : () => _startPlaylistDownload(YoutubeService.modeMerge),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _ActionButton(
+              label: 'Playlist Fast',
+              icon: Icons.flash_on_rounded,
+              color: const Color(0xFF1E1E2E),
+              onTap: _isWorking
+                  ? null
+                  : () => _startPlaylistDownload(YoutubeService.modeMuxed),
+            ),
+          ),
+        ],
+      );
+    }
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
-        Expanded(
-          child: _ActionButton(
-            label: 'Audio (MP3)',
-            icon: Icons.music_note_rounded,
-            color: Colors.deepPurpleAccent,
-            onTap: _isWorking
-                ? null
-                : () => _startDownload(YoutubeService.modeAudio),
+        SizedBox(
+          width: double.infinity,
+          height: 52,
+          child: ElevatedButton.icon(
+            onPressed: _isWorking ? null : () => _showFormatSelectionSheet(context),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.deepPurpleAccent,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
+              elevation: 4,
+            ),
+            icon: const Icon(Icons.settings_suggest_rounded, size: 24),
+            label: const Text(
+              'Настроить и скачать (Выбор качества)',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+            ),
           ),
         ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: _ActionButton(
-            label: 'Best Video (Merge)',
-            icon: Icons.high_quality_rounded,
-            color: const Color(0xFF7C4DFF),
-            onTap: _isWorking
-                ? null
-                : () => _startDownload(YoutubeService.modeMerge),
-          ),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: _ActionButton(
-            label: 'Fast Video (720p)',
-            icon: Icons.flash_on_rounded,
-            color: const Color(0xFFB388FF),
-            onTap: _isWorking
-                ? null
-                : () => _startDownload(YoutubeService.modeMuxed),
-          ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              child: _ActionButton(
+                label: 'Audio (MP3)',
+                icon: Icons.music_note_rounded,
+                color: const Color(0xFF1E1E2E),
+                onTap: _isWorking
+                    ? null
+                    : () => _startDownload(YoutubeService.modeAudio),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _ActionButton(
+                label: 'Best (Merge)',
+                icon: Icons.high_quality_rounded,
+                color: const Color(0xFF1E1E2E),
+                onTap: _isWorking
+                    ? null
+                    : () => _startDownload(YoutubeService.modeMerge),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _ActionButton(
+                label: 'Fast (720p)',
+                icon: Icons.flash_on_rounded,
+                color: const Color(0xFF1E1E2E),
+                onTap: _isWorking
+                    ? null
+                    : () => _startDownload(YoutubeService.modeMuxed),
+              ),
+            ),
+          ],
         ),
       ],
     );
@@ -681,36 +1078,400 @@ class _ActionButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final isDisabled = onTap == null;
     return SizedBox(
-      height: 64,
+      height: 52,
       child: ElevatedButton(
         onPressed: onTap,
         style: ElevatedButton.styleFrom(
           backgroundColor: isDisabled ? const Color(0xFF1C1C26) : color,
           foregroundColor: Colors.white,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: BorderRadius.circular(12),
           ),
-          elevation: isDisabled ? 0 : 4,
+          elevation: isDisabled ? 0 : 2,
         ),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(icon, size: 22),
-            const SizedBox(width: 8),
+            Icon(icon, size: 20),
+            const SizedBox(width: 6),
             Flexible(
               child: Text(
                 label,
                 textAlign: TextAlign.center,
-                maxLines: 2,
+                maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
                   fontWeight: FontWeight.w700,
-                  fontSize: 13,
+                  fontSize: 12,
                 ),
               ),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class FormatSelectionSheet extends StatefulWidget {
+  final YoutubeAnalysis analysis;
+  final Function(int? videoTag, int? audioTag) onDownload;
+
+  const FormatSelectionSheet({
+    super.key,
+    required this.analysis,
+    required this.onDownload,
+  });
+
+  @override
+  State<FormatSelectionSheet> createState() => _FormatSelectionSheetState();
+}
+
+class _FormatSelectionSheetState extends State<FormatSelectionSheet>
+    with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+
+  late List<YoutubeStreamFormat> _videoFormats;
+  late List<YoutubeStreamFormat> _audioFormats;
+
+  int? _selectedMergeVideoTag;
+  int? _selectedMergeAudioTag;
+  int? _selectedOnlyVideoTag;
+  int? _selectedOnlyAudioTag;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 3, vsync: this);
+
+    _videoFormats = widget.analysis.formats
+        .where((f) => f.type == 'video_only' || f.type == 'muxed')
+        .toList()
+      ..sort((a, b) => b.bitrateKbps.compareTo(a.bitrateKbps));
+
+    _audioFormats = widget.analysis.formats
+        .where((f) => f.type == 'audio_only')
+        .toList()
+      ..sort((a, b) => b.bitrateKbps.compareTo(a.bitrateKbps));
+
+    _selectedMergeVideoTag = _videoFormats.firstOrNull?.tag;
+    _selectedMergeAudioTag = _audioFormats.firstOrNull?.tag;
+    _selectedOnlyVideoTag = _videoFormats.firstOrNull?.tag;
+    _selectedOnlyAudioTag = _audioFormats.firstOrNull?.tag;
+
+    _tabController.addListener(() {
+      if (!_tabController.indexIsChanging) {
+        setState(() {});
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  YoutubeStreamFormat? _findFormat(List<YoutubeStreamFormat> list, int? tag) {
+    if (tag == null) return null;
+    for (final f in list) {
+      if (f.tag == tag) return f;
+    }
+    return null;
+  }
+
+  double _getSelectedSizeMb() {
+    if (_tabController.index == 0) {
+      final vSize = _findFormat(_videoFormats, _selectedMergeVideoTag)?.sizeMb ?? 0.0;
+      final aSize = _findFormat(_audioFormats, _selectedMergeAudioTag)?.sizeMb ?? 0.0;
+      return vSize + aSize;
+    } else if (_tabController.index == 1) {
+      return _findFormat(_videoFormats, _selectedOnlyVideoTag)?.sizeMb ?? 0.0;
+    } else {
+      return _findFormat(_audioFormats, _selectedOnlyAudioTag)?.sizeMb ?? 0.0;
+    }
+  }
+
+  void _onDownloadPressed() {
+    Navigator.pop(context);
+    if (_tabController.index == 0) {
+      widget.onDownload(_selectedMergeVideoTag, _selectedMergeAudioTag);
+    } else if (_tabController.index == 1) {
+      widget.onDownload(_selectedOnlyVideoTag, null);
+    } else {
+      widget.onDownload(null, _selectedOnlyAudioTag);
+    }
+  }
+
+  Widget _buildFormatTile({
+    required YoutubeStreamFormat format,
+    required bool isSelected,
+    required VoidCallback onTap,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: isSelected ? const Color(0xFF1C1B2E) : const Color(0xFF0F111A),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isSelected ? Colors.deepPurpleAccent : const Color(0xFF26263B),
+          width: 1.5,
+        ),
+      ),
+      child: ListTile(
+        onTap: onTap,
+        dense: true,
+        leading: Icon(
+          format.type == 'audio_only'
+              ? Icons.audiotrack_rounded
+              : Icons.video_collection_rounded,
+          color: isSelected ? Colors.deepPurpleAccent : Colors.grey,
+        ),
+        title: Text(
+          '${format.qualityLabel} (${format.container.toUpperCase()})',
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+            fontSize: 13,
+          ),
+        ),
+        subtitle: Text(
+          'Codec: ${format.codec} | Bitrate: ${format.bitrateKbps} kbps',
+          style: TextStyle(color: Colors.grey.shade400, fontSize: 11),
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              '${format.sizeMb.toStringAsFixed(1)} MB',
+              style: TextStyle(
+                color: isSelected ? Colors.deepPurpleAccent : Colors.grey.shade300,
+                fontWeight: FontWeight.w600,
+                fontSize: 12,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Icon(
+              isSelected
+                  ? Icons.radio_button_checked_rounded
+                  : Icons.radio_button_off_rounded,
+              color: isSelected ? Colors.deepPurpleAccent : Colors.grey.shade600,
+              size: 20,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomActionBar() {
+    final size = _getSelectedSizeMb();
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: const BoxDecoration(
+        color: Color(0xFF0A0C14),
+        border: Border(
+          top: BorderSide(color: Color(0xFF1F2335), width: 1.5),
+        ),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Row(
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'ОЦЕНКА РАЗМЕРА:',
+                  style: TextStyle(
+                    color: Colors.grey,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+                Text(
+                  '${size.toStringAsFixed(1)} MB',
+                  style: const TextStyle(
+                    color: Colors.greenAccent,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(width: 24),
+            Expanded(
+              child: SizedBox(
+                height: 48,
+                child: ElevatedButton.icon(
+                  onPressed: _onDownloadPressed,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurpleAccent,
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    elevation: 4,
+                  ),
+                  icon: const Icon(Icons.download_rounded, size: 20),
+                  label: const Text(
+                    'СКАЧАТЬ',
+                    style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.8),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: Color(0xFF0F111A),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 12),
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.grey.shade700,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'Выбор качества загрузки',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 16),
+          TabBar(
+            controller: _tabController,
+            tabs: const [
+              Tab(
+                icon: Icon(Icons.video_library_rounded, size: 20),
+                text: 'Видео+Звук',
+              ),
+              Tab(
+                icon: Icon(Icons.video_collection_rounded, size: 20),
+                text: 'Только Видео',
+              ),
+              Tab(
+                icon: Icon(Icons.audiotrack_rounded, size: 20),
+                text: 'Только Аудио',
+              ),
+            ],
+            indicatorColor: Colors.deepPurpleAccent,
+            labelColor: Colors.deepPurpleAccent,
+            unselectedLabelColor: Colors.grey,
+            labelStyle: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: TabBarView(
+              controller: _tabController,
+              children: [
+                // Tab 1: Video + Audio (Merge)
+                ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  itemCount: _videoFormats.length + _audioFormats.length + 2,
+                  itemBuilder: (context, index) {
+                    if (index == 0) {
+                      return const Padding(
+                        padding: EdgeInsets.only(bottom: 8, top: 4),
+                        child: Text(
+                          'ВЫБЕРИТЕ ВИДЕОДОРОЖКУ:',
+                          style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 11),
+                        ),
+                      );
+                    }
+                    if (index <= _videoFormats.length) {
+                      final f = _videoFormats[index - 1];
+                      return _buildFormatTile(
+                        format: f,
+                        isSelected: _selectedMergeVideoTag == f.tag,
+                        onTap: () => setState(() => _selectedMergeVideoTag = f.tag),
+                      );
+                    }
+                    if (index == _videoFormats.length + 1) {
+                      return const Padding(
+                        padding: EdgeInsets.only(bottom: 8, top: 12),
+                        child: Text(
+                          'ВЫБЕРИТЕ АУДИОДОРОЖКУ:',
+                          style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 11),
+                        ),
+                      );
+                    }
+                    final f = _audioFormats[index - _videoFormats.length - 2];
+                    return _buildFormatTile(
+                      format: f,
+                      isSelected: _selectedMergeAudioTag == f.tag,
+                      onTap: () => setState(() => _selectedMergeAudioTag = f.tag),
+                    );
+                  },
+                ),
+                // Tab 2: Only Video
+                ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  itemCount: _videoFormats.length + 1,
+                  itemBuilder: (context, index) {
+                    if (index == 0) {
+                      return const Padding(
+                        padding: EdgeInsets.only(bottom: 8, top: 4),
+                        child: Text(
+                          'ВЫБЕРИТЕ ВИДЕОДОРОЖКУ (БЕЗ ЗВУКА):',
+                          style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 11),
+                        ),
+                      );
+                    }
+                    final f = _videoFormats[index - 1];
+                    return _buildFormatTile(
+                      format: f,
+                      isSelected: _selectedOnlyVideoTag == f.tag,
+                      onTap: () => setState(() => _selectedOnlyVideoTag = f.tag),
+                    );
+                  },
+                ),
+                // Tab 3: Only Audio
+                ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  itemCount: _audioFormats.length + 1,
+                  itemBuilder: (context, index) {
+                    if (index == 0) {
+                      return const Padding(
+                        padding: EdgeInsets.only(bottom: 8, top: 4),
+                        child: Text(
+                          'ВЫБЕРИТЕ АУДИОДОРОЖКУ (КОНВЕРТИРУЕТСЯ В MP3):',
+                          style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 11),
+                        ),
+                      );
+                    }
+                    final f = _audioFormats[index - 1];
+                    return _buildFormatTile(
+                      format: f,
+                      isSelected: _selectedOnlyAudioTag == f.tag,
+                      onTap: () => setState(() => _selectedOnlyAudioTag = f.tag),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+          _buildBottomActionBar(),
+        ],
       ),
     );
   }
