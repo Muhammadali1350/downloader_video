@@ -161,10 +161,10 @@ class YoutubeService {
 
       VideoId? videoId;
       try {
-        videoId = VideoId(trimmedUrl);
+        videoId = _resolveVideoId(trimmedUrl);
       } catch (_) {
         if (playlistAnalysis != null && playlistAnalysis.videos.isNotEmpty) {
-          videoId = VideoId(playlistAnalysis.videos.first.id);
+          videoId = _resolveVideoId(playlistAnalysis.videos.first.id);
         }
       }
 
@@ -302,8 +302,8 @@ class YoutubeService {
 
     try {
       log('Parsing URL...');
-      // CRITICAL: always use VideoId(url.trim()) so Shorts / dirty URLs work.
-      final videoId = VideoId(url.trim());
+      // CRITICAL: use _resolveVideoId to correctly parse Shorts / dirty URLs.
+      final videoId = _resolveVideoId(url);
 
       setStatus('downloading');
 
@@ -468,7 +468,7 @@ class YoutubeService {
 
     try {
       log('Parsing URL...');
-      final videoId = VideoId(url.trim());
+      final videoId = _resolveVideoId(url);
 
       setStatus('downloading');
 
@@ -695,6 +695,24 @@ class YoutubeService {
     } finally {
       yt.close();
     }
+  }
+
+  /// Extract VideoId robustly, with custom parsing for YouTube Shorts.
+  VideoId _resolveVideoId(String url) {
+    final trimmed = url.trim();
+    try {
+      final uri = Uri.parse(trimmed);
+      if (uri.pathSegments.contains('shorts')) {
+        final idx = uri.pathSegments.indexOf('shorts');
+        if (idx >= 0 && idx < uri.pathSegments.length - 1) {
+          final possibleId = uri.pathSegments[idx + 1];
+          if (possibleId.length == 11) {
+            return VideoId(possibleId);
+          }
+        }
+      }
+    } catch (_) {}
+    return VideoId(trimmed);
   }
 
   /// Make a filesystem-safe file name from a video title.
@@ -1302,6 +1320,7 @@ class CustomYoutubeHttpClient extends YoutubeHttpClient {
     var url = streamInfo.url;
     int bytesCount = start;
     const int chunkSize = 512 * 1024; // 512 KB chunks
+    int consecutiveRefreshes = 0;
 
     while (!closed && bytesCount < streamInfo.size.totalBytes) {
       try {
@@ -1313,7 +1332,7 @@ class CustomYoutubeHttpClient extends YoutubeHttpClient {
           }
 
           late final http.Request request;
-          final useRangeHeader = url.queryParameters['c']?.startsWith('ANDROID') ?? false;
+          final useRangeHeader = url.queryParameters['c']?.toUpperCase().contains('ANDROID') ?? false;
           if (useRangeHeader) {
             request = http.Request('get', url);
             request.headers['Range'] = 'bytes=$from-$to';
@@ -1327,9 +1346,16 @@ class CustomYoutubeHttpClient extends YoutubeHttpClient {
         if (validate) {
           try {
             customValidateResponse(response, response.statusCode);
-          } on FatalFailureException {
-            final newManifest =
-                await streamClient.getManifest(streamInfo.videoId);
+          } on FatalFailureException catch (e) {
+            consecutiveRefreshes++;
+            if (consecutiveRefreshes >= 3) {
+              throw StateError('Превышено количество попыток обновления манифеста для обхода 403: $e');
+            }
+
+            final newManifest = await streamClient.getManifest(
+              streamInfo.videoId,
+              ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+            );
             StreamInfo? stream;
             for (final s in newManifest.streams) {
               if (s.tag == streamInfo.tag) {
@@ -1344,6 +1370,8 @@ class CustomYoutubeHttpClient extends YoutubeHttpClient {
             continue;
           }
         }
+
+        consecutiveRefreshes = 0;
 
         final controller = StreamController<List<int>>();
         response.stream.listen(
