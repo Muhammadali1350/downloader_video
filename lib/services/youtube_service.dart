@@ -180,6 +180,10 @@ class YoutubeService {
               duration: video.duration,
               thumbnailUrl: video.thumbnails.highResUrl,
             ));
+            if (videosList.length >= 500) {
+              onLog('Достигнут лимит анализа в 500 видео для плейлиста.');
+              break;
+            }
           }
           
           playlistAnalysis = YoutubePlaylistAnalysis(
@@ -218,18 +222,23 @@ class YoutubeService {
       String thumbnailUrl = 'https://img.youtube.com/vi/${videoId.value}/0.jpg';
 
       try {
-        final video = await yt.videos.get(videoId);
-        title = video.title;
-        author = video.author;
-        duration = video.duration;
-        thumbnailUrl = video.thumbnails.highResUrl;
-      } catch (e) {
-        onLog('Metadata fetch failed: $e. Using fallback iOS API...');
+        onLog('Fetching video details via iOS API...');
         final fallbackDetails = await _fetchMetadataViaIosApi(videoId.value);
         title = fallbackDetails.title;
         author = fallbackDetails.author;
         duration = fallbackDetails.duration;
         thumbnailUrl = fallbackDetails.thumbnailUrl;
+      } catch (e) {
+        onLog('iOS API fetch failed: $e. Using standard Explode details...');
+        try {
+          final video = await yt.videos.get(videoId);
+          title = video.title;
+          author = video.author;
+          duration = video.duration;
+          thumbnailUrl = video.thumbnails.highResUrl;
+        } catch (e2) {
+          onLog('Standard details fetch failed: $e2');
+        }
       }
 
       onLog('Fetching available formats...');
@@ -237,19 +246,19 @@ class YoutubeService {
       try {
         manifest = await yt.videos.streamsClient.getManifest(
           videoId,
-          requireWatchPage: true,
+          requireWatchPage: false,
           ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
         );
       } catch (e) {
-        onLog('Failed to get manifest with watch page: $e. Using fallback manifest...');
+        onLog('Failed to get manifest: $e. Trying with watch page...');
         try {
           manifest = await yt.videos.streamsClient.getManifest(
             videoId,
-            requireWatchPage: false,
+            requireWatchPage: true,
             ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
           );
         } catch (e2) {
-          onLog('Failed fallback manifest: $e2');
+          onLog('Failed watch page manifest: $e2');
         }
       }
 
@@ -336,12 +345,13 @@ class YoutubeService {
       log('Fetching video details...');
       String title;
       try {
-        final video = await yt.videos.get(videoId);
-        title = video.title;
-      } catch (e) {
-        log('Standard fetch details failed: $e. Using fallback iOS API...');
+        log('Fetching details via iOS API...');
         final fallbackDetails = await _fetchMetadataViaIosApi(videoId.value);
         title = fallbackDetails.title;
+      } catch (e) {
+        log('iOS API details fetch failed: $e. Falling back to standard Explode details...');
+        final video = await yt.videos.get(videoId);
+        title = video.title;
       }
 
       final tempDir = await getTemporaryDirectory();
@@ -349,17 +359,17 @@ class YoutubeService {
 
       StreamManifest manifest;
       try {
-        log('Fetching stream manifest (with watch page)...');
-        manifest = await yt.videos.streamsClient.getManifest(
-          videoId,
-          requireWatchPage: true,
-          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
-        );
-      } catch (e) {
-        log('Failed to fetch manifest with watch page: $e. Using fallback player-only manifest...');
+        log('Fetching stream manifest...');
         manifest = await yt.videos.streamsClient.getManifest(
           videoId,
           requireWatchPage: false,
+          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+        );
+      } catch (e) {
+        log('Failed to fetch manifest: $e. Trying with watch page...');
+        manifest = await yt.videos.streamsClient.getManifest(
+          videoId,
+          requireWatchPage: true,
           ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
         );
       }
@@ -545,27 +555,28 @@ class YoutubeService {
       log('Fetching video details...');
       String title;
       try {
-        final video = await yt.videos.get(videoId);
-        title = video.title;
-      } catch (e) {
-        log('Standard fetch details failed: $e. Using fallback iOS API...');
+        log('Fetching details via iOS API...');
         final fallbackDetails = await _fetchMetadataViaIosApi(videoId.value);
         title = fallbackDetails.title;
+      } catch (e) {
+        log('iOS API details fetch failed: $e. Falling back to standard Explode details...');
+        final video = await yt.videos.get(videoId);
+        title = video.title;
       }
 
       StreamManifest manifest;
       try {
-        log('Fetching stream manifest (with watch page)...');
-        manifest = await yt.videos.streamsClient.getManifest(
-          videoId,
-          requireWatchPage: true,
-          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
-        );
-      } catch (e) {
-        log('Failed to fetch manifest with watch page: $e. Using fallback player-only manifest...');
+        log('Fetching stream manifest...');
         manifest = await yt.videos.streamsClient.getManifest(
           videoId,
           requireWatchPage: false,
+          ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
+        );
+      } catch (e) {
+        log('Failed to fetch manifest: $e. Trying with watch page...');
+        manifest = await yt.videos.streamsClient.getManifest(
+          videoId,
+          requireWatchPage: true,
           ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.androidSdkless],
         );
       }
