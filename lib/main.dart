@@ -1,4 +1,6 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter_displaymode/flutter_displaymode.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'ui/home_screen.dart';
@@ -9,6 +11,12 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await MediaStore.ensureInitialized();
   MediaStore.appFolder = 'DownloadVideos_App';
+
+  if (Platform.isAndroid) {
+    try {
+      await FlutterDisplayMode.setHighRefreshRate();
+    } catch (_) {}
+  }
 
   runApp(
     const ProviderScope(

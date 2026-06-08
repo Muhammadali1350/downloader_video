@@ -187,6 +187,7 @@ class HomeScreen extends ConsumerStatefulWidget {
 
 class _HomeScreenState extends ConsumerState<HomeScreen> {
   final TextEditingController _urlController = TextEditingController();
+  final FocusNode _urlFocusNode = FocusNode();
   bool _hasAnalysis = false;
   bool _isAnalyzing = false;
   bool _isWorking = false;
@@ -210,6 +211,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   void dispose() {
     _urlController.dispose();
+    _urlFocusNode.dispose();
     super.dispose();
   }
 
@@ -269,6 +271,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _onAnalyzePressed() async {
+    _urlFocusNode.unfocus();
     final rawUrl = _urlController.text.trim();
     if (rawUrl.isEmpty) {
       _showCustomSnackBar(t('toastNoVideo'), isError: true);
@@ -341,7 +344,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     });
 
     ref.read(progressProvider.notifier).set(0.0);
-    ref.read(detailedProgressProvider.notifier).reset();
+    final hasVideo = mode != YoutubeService.modeAudio;
+    final hasAudio = mode != YoutubeService.modeMuxed;
+    ref.read(detailedProgressProvider.notifier).initialize(hasVideo: hasVideo, hasAudio: hasAudio);
     ref.read(downloadStatsProvider.notifier).clear();
     _appendLog('--- Starting $mode download ---');
 
@@ -395,7 +400,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     });
 
     ref.read(progressProvider.notifier).set(0.0);
-    ref.read(detailedProgressProvider.notifier).reset();
+    final hasVideo = videoTag != null;
+    final hasAudio = audioTag != null;
+    ref.read(detailedProgressProvider.notifier).initialize(hasVideo: hasVideo, hasAudio: hasAudio);
     ref.read(downloadStatsProvider.notifier).clear();
     _appendLog('--- Starting custom download (Video: $videoTag, Audio: $audioTag) ---');
 
@@ -458,7 +465,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     });
 
     ref.read(progressProvider.notifier).set(0.0);
-    ref.read(detailedProgressProvider.notifier).reset();
+    final hasVideo = mode != YoutubeService.modeAudio;
+    final hasAudio = mode != YoutubeService.modeMuxed;
+    ref.read(detailedProgressProvider.notifier).initialize(hasVideo: hasVideo, hasAudio: hasAudio);
     ref.read(downloadStatsProvider.notifier).clear();
     ref.read(playlistProgressProvider.notifier).reset();
     _appendLog('--- Starting playlist download (Mode: $mode, Videos: ${selectedIds.length}) ---');
@@ -511,6 +520,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   void _showFormatSelectionSheet(BuildContext context) {
     if (_analysis == null) return;
+    _urlFocusNode.unfocus();
+    FocusScope.of(context).unfocus();
 
     showModalBottomSheet(
       context: context,
@@ -530,6 +541,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _showSettingsDialog(BuildContext context) async {
+    _urlFocusNode.unfocus();
+    FocusScope.of(context).unfocus();
     final settingsService = ref.read(settingsServiceProvider);
     final settings = await settingsService.loadSettings();
 
@@ -563,6 +576,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             ],
           ),
           content: SingleChildScrollView(
+            physics: const BouncingScrollPhysics(),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -762,6 +776,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 final newSettings = AppSettings(
                   userAgent: userAgentController.text.trim(),
                   cookies: cookiesController.text.trim(),
+                  separateProgressBars: settings.separateProgressBars,
                 );
                 await settingsService.saveSettings(newSettings);
                 if (context.mounted) {
@@ -895,6 +910,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                       Expanded(
                         flex: 12,
                         child: SingleChildScrollView(
+                          physics: const BouncingScrollPhysics(),
                           padding: const EdgeInsets.all(20),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -920,6 +936,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                           children: [
                             Expanded(
                               child: SingleChildScrollView(
+                                physics: const BouncingScrollPhysics(),
                                 padding: const EdgeInsets.all(20),
                                 child: Column(
                                   children: [
@@ -943,6 +960,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                     children: [
                       Expanded(
                         child: SingleChildScrollView(
+                          physics: const BouncingScrollPhysics(),
                           padding: const EdgeInsets.all(16),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -998,6 +1016,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   message: t('tooltipUrlInput'),
                   child: TextField(
                     controller: _urlController,
+                    focusNode: _urlFocusNode,
                     style: const TextStyle(color: Colors.white, fontSize: 14),
                     decoration: InputDecoration(
                       filled: true,
@@ -1300,6 +1319,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             border: Border.all(color: const Color(0xFF1E2139)),
           ),
           child: ListView.builder(
+            physics: const BouncingScrollPhysics(),
             shrinkWrap: true,
             itemCount: playlist.videos.length,
             itemBuilder: (context, idx) {
@@ -1650,29 +1670,35 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         // Video Progress
-        _buildDetailedProgressItem(
-          label: t('videoProgress'),
-          progress: state.videoProgress,
-          isActive: isDownloadingVideo,
-          isCompleted: !isDownloadingVideo && (isDownloadingAudio || isConverting || isExporting),
-        ),
-        const SizedBox(height: 10),
+        if (state.hasVideo) ...[
+          _buildDetailedProgressItem(
+            label: t('videoProgress'),
+            progress: state.videoProgress,
+            isActive: isDownloadingVideo,
+            isCompleted: !isDownloadingVideo && (isDownloadingAudio || isConverting || isExporting),
+          ),
+          const SizedBox(height: 10),
+        ],
         // Audio Progress
-        _buildDetailedProgressItem(
-          label: t('audioProgress'),
-          progress: state.audioProgress,
-          isActive: isDownloadingAudio,
-          isCompleted: !isDownloadingAudio && (isConverting || isExporting),
-        ),
-        const SizedBox(height: 10),
+        if (state.hasAudio) ...[
+          _buildDetailedProgressItem(
+            label: t('audioProgress'),
+            progress: state.audioProgress,
+            isActive: isDownloadingAudio,
+            isCompleted: !isDownloadingAudio && (isConverting || isExporting),
+          ),
+          const SizedBox(height: 10),
+        ],
         // Merge/Processing Progress
-        _buildDetailedProgressItem(
-          label: t('mergeProgress'),
-          progress: (isConverting || isExporting) ? 1.0 : 0.0,
-          isActive: isConverting || isExporting,
-          isCompleted: isExporting && !isConverting,
-          isIndeterminate: isConverting,
-        ),
+        if (state.hasAudio) ...[
+          _buildDetailedProgressItem(
+            label: t('mergeProgress'),
+            progress: (isConverting || isExporting) ? 1.0 : 0.0,
+            isActive: isConverting || isExporting,
+            isCompleted: isExporting && !isConverting,
+            isIndeterminate: isConverting,
+          ),
+        ],
       ],
     );
   }
@@ -1856,6 +1882,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                                   ),
                                 )
                               : ListView.builder(
+                                  physics: const BouncingScrollPhysics(),
                                   itemCount: logs.length,
                                   itemBuilder: (context, index) {
                                     return Text('> ${logs[index]}');
@@ -2210,6 +2237,7 @@ class _FormatSelectionSheetState extends State<FormatSelectionSheet>
               children: [
                 // Tab 1: Video + Audio (Merge)
                 ListView.builder(
+                  physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   itemCount: _videoFormats.length + _audioFormats.length + 2,
                   itemBuilder: (context, index) {
@@ -2249,6 +2277,7 @@ class _FormatSelectionSheetState extends State<FormatSelectionSheet>
                 ),
                 // Tab 2: Only Video
                 ListView.builder(
+                  physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   itemCount: _videoFormats.length + 1,
                   itemBuilder: (context, index) {
@@ -2271,6 +2300,7 @@ class _FormatSelectionSheetState extends State<FormatSelectionSheet>
                 ),
                 // Tab 3: Only Audio
                 ListView.builder(
+                  physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   itemCount: _audioFormats.length + 1,
                   itemBuilder: (context, index) {

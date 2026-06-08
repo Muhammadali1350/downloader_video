@@ -5,16 +5,19 @@ import 'package:path_provider/path_provider.dart';
 class AppSettings {
   final String userAgent;
   final String cookies;
+  final bool separateProgressBars;
 
   AppSettings({
     required this.userAgent,
     required this.cookies,
+    required this.separateProgressBars,
   });
 
   factory AppSettings.defaultSettings() {
     return AppSettings(
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       cookies: '',
+      separateProgressBars: false,
     );
   }
 
@@ -22,6 +25,7 @@ class AppSettings {
     return {
       'userAgent': userAgent,
       'cookies': cookies,
+      'separateProgressBars': separateProgressBars,
     };
   }
 
@@ -29,6 +33,7 @@ class AppSettings {
     return AppSettings(
       userAgent: json['userAgent'] ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       cookies: json['cookies'] ?? '',
+      separateProgressBars: json['separateProgressBars'] ?? false,
     );
   }
 }

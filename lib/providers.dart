@@ -33,10 +33,23 @@ final languageProvider = NotifierProvider<LanguageNotifier, String>(LanguageNoti
 /// Toggles whether we show separate progress bars for Video, Audio, and Merge processes.
 class SeparateProgressBarsNotifier extends Notifier<bool> {
   @override
-  bool build() => false;
+  bool build() {
+    ref.read(settingsServiceProvider).loadSettings().then((settings) {
+      state = settings.separateProgressBars;
+    });
+    return false;
+  }
 
-  void set(bool value) {
+  void set(bool value) async {
     state = value;
+    final settingsService = ref.read(settingsServiceProvider);
+    final settings = await settingsService.loadSettings();
+    final updatedSettings = AppSettings(
+      userAgent: settings.userAgent,
+      cookies: settings.cookies,
+      separateProgressBars: value,
+    );
+    await settingsService.saveSettings(updatedSettings);
   }
 }
 final separateProgressBarsProvider = NotifierProvider<SeparateProgressBarsNotifier, bool>(SeparateProgressBarsNotifier.new);
@@ -72,11 +85,15 @@ class DetailedProgressState {
   final double videoProgress;
   final double audioProgress;
   final String currentAction; // 'idle', 'downloading_video', 'downloading_audio', 'converting', 'exporting'
+  final bool hasVideo;
+  final bool hasAudio;
 
   DetailedProgressState({
     this.videoProgress = 0.0,
     this.audioProgress = 0.0,
     this.currentAction = 'idle',
+    this.hasVideo = true,
+    this.hasAudio = true,
   });
 }
 
@@ -89,6 +106,18 @@ class DetailedProgressNotifier extends Notifier<DetailedProgressState> {
       videoProgress: videoProgress ?? state.videoProgress,
       audioProgress: audioProgress ?? state.audioProgress,
       currentAction: currentAction ?? state.currentAction,
+      hasVideo: state.hasVideo,
+      hasAudio: state.hasAudio,
+    );
+  }
+
+  void initialize({required bool hasVideo, required bool hasAudio}) {
+    state = DetailedProgressState(
+      videoProgress: 0.0,
+      audioProgress: 0.0,
+      currentAction: 'idle',
+      hasVideo: hasVideo,
+      hasAudio: hasAudio,
     );
   }
 

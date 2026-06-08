@@ -1088,7 +1088,7 @@ class YoutubeService {
     final videoStream = yt.videos.streamsClient.get(video);
     final audioStream = yt.videos.streamsClient.get(audio);
 
-    onLog('Starting download (Adaptive). If this hangs for 10s, app will auto-switch to Fast mode.');
+    onLog('Starting download (Adaptive).');
 
     try {
       var videoBytesDownloaded = 0;
@@ -1131,27 +1131,7 @@ class YoutubeService {
         if (videoFile.existsSync()) await videoFile.delete();
         if (audioFile.existsSync()) await audioFile.delete();
       } catch (_) {}
-      
-      if (e is CancellationException) {
-        rethrow;
-      }
-
-      onLog('Adaptive stream download failed: $e');
-      onLog('Falling back to "Muxed" (Fast) strategy to ensure download completion...');
-
-      await _downloadMuxed(
-        yt: yt,
-        manifest: manifest,
-        baseDir: baseDir,
-        baseName: baseName,
-        onLog: onLog,
-        onProgress: onProgress,
-        onStatus: onStatus,
-        onStats: onStats,
-        onDetailedProgress: onDetailedProgress,
-        playlistName: playlistName,
-      );
-      return;
+      rethrow;
     }
 
     if (_isCancelled) throw CancellationException();
